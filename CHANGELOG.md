@@ -1,5 +1,47 @@
 # Changelog
 
+## [0.12.0](https://github.com/useplunk/plunk/compare/v0.11.0...v0.12.0) (2026-05-27)
+
+
+### Features
+
+* add disabledReason field to projects for better tracking of disable reasons ([94ceadb](https://github.com/useplunk/plunk/commit/94ceadbbe417f0cb3ab72c66bfad9428bdce2d11))
+* **api:** allow API key authentication for domain endpoints ([d2496bc](https://github.com/useplunk/plunk/commit/d2496bc51d17657380160dbfc20e099d3f4eadba))
+* **contacts:** make email cell a link to the contact detail page ([6759bff](https://github.com/useplunk/plunk/commit/6759bffd2a1f0bfb09b754bb0efdfe5c347ea2b3))
+* **contacts:** make email cell a link to the contact detail page ([6d98d51](https://github.com/useplunk/plunk/commit/6d98d512222ffb422bc2a4bef4284a644558b39d))
+* **EmailService:** add worker concurrency settings and improve email queue prioritization ([80beb2b](https://github.com/useplunk/plunk/commit/80beb2bb9937101d1723f2d54648060fdcbe6cef))
+* make detectCustomHtmlPatterns aware of TipTap's actual capabilities ([9797aed](https://github.com/useplunk/plunk/commit/9797aed47f520aba51bec4e09c9bc4b7762e02f8))
+* make detectCustomHtmlPatterns aware of TipTap's actual capabilities ([ba3813e](https://github.com/useplunk/plunk/commit/ba3813e2422d9fe4e252a90242393cada65644dc))
+* render template variables in WEBHOOK step url, headers and body ([bfecf04](https://github.com/useplunk/plunk/commit/bfecf04fa38309804ee19e99b9908caf51c5e039))
+* render template variables in WEBHOOK step url, headers and body ([c484da8](https://github.com/useplunk/plunk/commit/c484da88ab7b4635987868e2e3c6fdded68ade8c))
+* **SecurityService:** enhance phishing detection by verifying sender domains and institutional TLDs ([6ab4d77](https://github.com/useplunk/plunk/commit/6ab4d77ca9bebd01f75d8799dad23fdec7768b52))
+* **SecurityService:** enhance phishing detection by verifying sender domains and institutional TLDs ([edfc399](https://github.com/useplunk/plunk/commit/edfc399061cb7fd079b7f11167a2796df766d8ac))
+* **tests:** enhance test database setup and cleanup for improved isolation and performance ([32dd7bb](https://github.com/useplunk/plunk/commit/32dd7bba462a6f4a13d59b8fb03708f971d1eff0))
+
+
+### Bug Fixes
+
+* coerce boolean and numeric values in custom CSV columns ([4a145f3](https://github.com/useplunk/plunk/commit/4a145f3488bee63c2d82a4a477f6dfaaaaede64b))
+* **filters:** land templates/workflows/campaigns search inputs at 32px to match filter buttons ([283f402](https://github.com/useplunk/plunk/commit/283f40239dcc81e78d35b39cb9b31f97b435b8d7))
+* make email templates, campaigns and workflow search inputs same height as the rest of the app ([8b3657d](https://github.com/useplunk/plunk/commit/8b3657d056938b17f0634c0fe8d664ae1e07cd73))
+
+
+### Code Refactoring
+
+* **database:** increase Prisma connection pool limits for improved test performance ([71e2277](https://github.com/useplunk/plunk/commit/71e227764319e6fc732aefdebd11f3e844257ef6))
+* **SecurityService:** update absolute count ceilings for new projects to improve spam detection ([4de40f4](https://github.com/useplunk/plunk/commit/4de40f40fa300c9e9ed2ed35f367ca4cd601f309))
+
+
+### Documentation
+
+* add env-var sync rule to CLAUDE.md ([a348d37](https://github.com/useplunk/plunk/commit/a348d37c21ecf1d57845f31210f66a8113fadb8d))
+* add new recipe pages for waitlist and sync unsubscribes ([01ec34a](https://github.com/useplunk/plunk/commit/01ec34a8cbbe0f4a158398c0eb8300d847bc29ab))
+* correct PHISHING_CONFIDENCE_THRESHOLD default in CLAUDE.md ([5c16679](https://github.com/useplunk/plunk/commit/5c166797b57f2e7b714957824ee1acdcb22c05f2))
+* **env:** add wiki-documented vars to apps/api/.env.example ([81315ea](https://github.com/useplunk/plunk/commit/81315eac8eb32a7d2e61617c6a84f349afaf7860))
+* **env:** sync .env.self-host.example with missing variables ([1c1c95d](https://github.com/useplunk/plunk/commit/1c1c95d332fb9ab6c2f926f6d51071cfb245ed86))
+* **env:** sync env example files, fix CLAUDE.md drift, add process rule ([6ebbb50](https://github.com/useplunk/plunk/commit/6ebbb50f6817f1354f26cc7734631d3b6ded32ed))
+* **wiki:** document MAIL_FROM_SUBDOMAIN and NGINX_PORT env vars ([971b98a](https://github.com/useplunk/plunk/commit/971b98a4cc6145571204f5a4ad794aa3d09ea71c))
+
 ## [0.11.0](https://github.com/useplunk/plunk/compare/v0.10.0...v0.11.0) (2026-05-13)
 
 
