@@ -1189,3 +1189,287 @@ if (!wasSet) return;  // 原子地"查+写"，无时序窗口
    - `allowReentry=true`：PostgreSQL 用部分唯一索引 `CREATE UNIQUE INDEX ... WHERE status='RUNNING'` — 允许多条但只能有一条 RUNNING
 
 2. **应用层**：用 `prisma.$transaction` 或 `INSERT ... ON CONFLICT DO NOTHING RETURNING *` 把 findFirst + create 合成一次原子操作，把"先查后插"变成"要么插成功要么返回已有行"。
+
+---
+
+## 二十、SES Webhook 入口：SNS 重试压力下的签名验证与 200 OK 幂等
+
+### 入口代码全貌
+
+POST `/webhooks/sns` 接收来自 AWS SNS → SES 的所有出站邮件事件（Delivery/Open/Click/Bounce/Complaint）和入站邮件（Received）。完整实现见 [Webhooks.receiveSNSWebhook](file:///d:/fz/0601-1/solo-dogfeeding/code/57-plunk/apps/api/src/controllers/Webhooks.ts#L36-L477)。
+
+代码结构上遵循"**4 层防线**"，依次从外到内挡住重试风暴、伪造请求、慢处理压垮服务。
+
+### 第 1 层：签名验证（防伪造 → 403 直接拒）
+
+[SecurityService.verifySnsSignature](file:///d:/fz/0601-1/solo-dogfeeding/code/57-plunk/apps/api/src/services/SecurityService.ts#L177-L211)
+
+```
+L177 入口：三个条件缺一不可
+  ├─ SigningCertURL / Signature 存在
+  ├─ SigningCertURL 必须是 HTTPS，hostname 匹配正则
+  │     /^sns\.[a-z0-9-]+\.amazonaws\.(com|cn)$/
+  │     → 防止攻击者用自签名 cert 指向自己的服务器
+  └─ 证书内容验证签名：
+        L200 fetchSigningCert()   — 内存缓存 Map<url, pem>，同 cert URL 不二次 fetch
+        L201 buildSnsStringToSign — 根据 Type 选字段 + 固定顺序拼串
+        L202-L206 RSA-SHA256 (V2) 或 RSA-SHA1 (V1) crypto.verify()
+  返回 true / false
+```
+
+**抗压意义：** AWS SNS 的通知投递没有请求头 API Key，全靠这一套 RSA 签名。如果去掉签名验证，任何人 `POST /webhooks/sns` 捏造一个 `eventType=Delivery` + 已知的 `messageId` 就能：
+- 把邮件状态篡改为 DELIVERED/OPENED
+- 触发 `email.opened` 事件 → 下游工作流被恶意触发
+- 如果伪造了足够多的 messageId 并行打，还会耗尽 Prisma 连接池
+
+**证书缓存 `snsSigningCertCache`**（[SecurityService L144](file:///d:/fz/0601-1/solo-dogfeeding/code/57-plunk/apps/api/src/services/SecurityService.ts#L144)）是进程内 `Map`，没有 TTL 失效。好处是高并发下不打 AWS S3 证书桶，坏处是 AWS 轮转证书后要重启进程（实际生产中 SNS 证书轮转频率极低，是数月到年级别）。
+
+### 第 2 层：SubscribeURL SSRF 限制（防订阅劫持）
+
+[Webhooks L48-L98](file:///d:/fz/0601-1/solo-dogfeeding/code/57-plunk/apps/api/src/controllers/Webhooks.ts#L48-L98)
+
+SNS 初次创建 Topic 订阅时，会先发一条 `Type: SubscriptionConfirmation` 通知，里面带 `SubscribeURL`，Plunk 要主动 GET 这个 URL 才算订阅建立。
+
+这一步如果开放任意 URL，攻击者可以：
+1. 构造一个假的 SNS `SubscriptionConfirmation`（签名对不上，过不了第 1 层 ✅）
+2. 或者拿真实的 SNS 订阅但改 SubscribeURL 指向内网 169.254、公司 Redis、K8s API 等
+
+防护分两层：
+- **正则白名单**：`/^sns\.[a-z0-9-]+\.amazonaws\.(com|eu)$/`（[L70](file:///d:/fz/0601-1/solo-dogfeeding/code/57-plunk/apps/api/src/controllers/Webhooks.ts#L70)）— 只允许 HTTPS + 官方 AWS SNS 主机名
+- **失败也返回 200**：确认失败不返回 4xx，防止攻击者扫描哪些 AWS region 的 SNS 主机名被放行
+
+### 第 3 层：200 OK 幂等响应（防 SNS 指数重试风暴）
+
+AWS SNS 的投递策略是：**收到非 2xx → 立即重试 → 指数退避 → 最多重试 100,012 次，持续 3 天**。在高流量场景下（百万级邮件发送 → 百万级 open/click 事件），只要 API 有 1% 的 500，重试风暴就能把服务打垮。
+
+Plunk 把所有处理包在单个大 `try/catch` 里，**所有异常路径都 return 200**：
+
+| 位置 | 异常情况 | 返回码 |
+|------|---------|-------|
+| L44 | 签名校验失败 | 403（有意返回，防伪造） |
+| L87-L97 | SubscribeURL fetch 失败/抛错 | 200 |
+| L104 | 未知 Type | 200 |
+| L120 | 入站邮件找不到 recipients | 200 |
+| L280-L284 | 入站邮件处理内部抛错 | 200 |
+| L307 | messageId 查不到 Email 记录 | **404**（⚠️ 这个会触发 SNS 重试） |
+| L451 | 未知 eventType | 200 |
+| L472-L476 | 整条链路最外层兜底 catch | **200** |
+
+**唯一一个非 2xx 的"非签名"路径**是 L307 的 `messageId → Email 查不到 → 404`。这在邮件发送后几毫秒内 SNS 先到、DB 还没写入 Email 行的竞争场景下会偶发。如果出现频率高，SNS 的指数重试最终也会让后续请求命中 DB（但代价是 SNS 多打几次）。
+
+### 第 4 层：工作流触发完全异步（不阻塞 HTTP 响应）
+
+所有处理的最后一步都是调用 `EventService.trackEvent(...)`（[L265](file:///d:/fz/0601-1/solo-dogfeeding/code/57-plunk/apps/api/src/controllers/Webhooks.ts#L265)、[L461](file:///d:/fz/0601-1/solo-dogfeeding/code/57-plunk/apps/api/src/controllers/Webhooks.ts#L461)），它里面：
+1. **同步写 DB**：Event 行 + 可能的 WorkflowExecution 行
+2. **同步入队**：如果工作流第一个步骤是需要延迟/异步的，就调 `QueueService.queueWorkflowStep`
+
+最坏情况下这两步会拖慢 HTTP 响应（写 Event 行 + 找工作流 + 查 Contact + create Execution + Redis LPUSH），但**没有把实际工作流执行（SEND_EMAIL/WEBHOOK/CONDITION）放在 HTTP 线程里**——这部分交给 BullMQ Worker。
+
+### SNS 重试压力下的完整抗压路径图
+
+```
+  百万级 SNS 并发投递 ──▶ API 入口
+                              │
+            ┌─────────────────┴──────────────────┐
+            ▼                                    ▼
+    签名验证失败 (403)                     签名通过
+     (攻击者 / 伪造请求)                        │
+                                       ┌────────┴────────┐
+                                       ▼                 ▼
+                              SubscriptionConfirm  Notification
+                              (SSRf 正则校验 + fetch)   │
+                                                         │
+                                       ┌─────────────────┼─────────────────┐
+                                       ▼                 ▼                 ▼
+                              Received(入站邮件)   Delivery/Open/Click   Bounce/Complaint
+                                       │                 │                 │
+                                       ▼                 ▼                 ▼
+                              findMany(domain)    findUnique(messageId)   同左 + unsubscribe
+                                       │                 │                 │
+                                       └────────┬────────┴─────────────────┘
+                                                ▼
+                                    EventService.trackEvent
+                                     ├─ prisma.event.create
+                                     ├─ triggerWorkflows (读缓存)
+                                     ├─ startWorkflowForContact (create execution)
+                                     └─ queueWorkflowStep (Redis LPUSH)
+                                                │
+                                                ▼
+                                       全部 return 200 ✅
+                                  (抛任何错走最外层 catch → 200)
+```
+
+---
+
+## 二十一、Segment 成员变更事件触发：是否形成工作流循环 + 断环机制
+
+### 循环是怎么可能发生的
+
+Segment 的 `computeMembership` 函数（[SegmentService L449-L631](file:///d:/fz/0601-1/solo-dogfeeding/code/57-plunk/apps/api/src/services/SegmentService.ts#L449-L631)）在计算出 toAdd/toRemove 后，会**对每个增删的联系人触发一个独立命名的事件**：
+
+```
+进入 Segment（toAdd 中的每个 contact）：
+  eventName = `segment.${slugifySegmentName(segment.name)}.entry`
+  → EventService.trackEvent(projectId, eventName, contactId, undefined, {segmentId, segmentName})
+     [L570-L582]
+
+离开 Segment（toRemove 中的每个 contact）：
+  eventName = `segment.${slugifySegmentName(segment.name)}.exit`
+  → EventService.trackEvent(projectId, eventName, contactId, undefined, {segmentId, segmentName})
+     [L600-L613]
+```
+
+这些事件会走 `triggerWorkflows()` 命中任何配置了 `triggerConfig.eventName === segment.xxx.entry` 的工作流。**如果工作流的下游动作会再次让 contact 的 segment 成员变化，就构成循环**。
+
+### 三种典型循环
+
+#### 循环 A："进入 A 段 → 改联系人数据 → 退出 A 段"
+
+```
+Segment "VIP" (条件: data.totalSpend >= 1000)
+  ├─ trackMembership = true
+  └─ 用户配了工作流：
+       trigger: segment.vip.entry
+         └─ UPDATE_CONTACT 步骤 → data.totalSpend *= 0.8  (给折扣)
+```
+
+**循环时序：**
+
+```
+T+0  computeMembership 发现 contactA totalSpend=1200 → 进入 VIP 段
+       └─ trackEvent(segment.vip.entry) → 启动工作流 W1
+T+0  W1 执行 UPDATE_CONTACT → totalSpend=960
+       └─ 此时 contact 已不再符合 VIP 条件
+T+5m 下一次 segment-count-repeatable 周期（cron */5 分）触发
+       └─ computeMembership(VIP) 发现 contactA 不再匹配 → 退出 VIP 段
+          └─ trackEvent(segment.vip.exit) → 启动工作流 W2（如果有人配）
+T+5m  W2 执行 UPDATE_CONTACT → totalSpend += 50（用户配了"VIP 退出补 50 红包"）
+       └─ totalSpend=1010 → 又符合 VIP 条件
+T+10m 下一次周期 computeMembership → contactA 又进入 VIP → track entry → ...
+```
+
+**无限循环形成，每 5 分钟一个周期交替。**
+
+#### 循环 B："A 段 entry 触发的 UPDATE_CONTACT 把人送进 B 段"
+
+```
+工作流 WA: segment.vip.entry → UPDATE_CONTACT data.tier='gold'
+工作流 WB: segment.gold-customers.entry → UPDATE_CONTACT data.totalSpend += 500
+```
+
+A 段 entry → B 段 entry → A 段 entry 的链条只要条件配合就能形成多米诺循环。
+
+#### 循环 C：UPDATE_CONTACT 修改"自身 segment 过滤依赖的字段" + 配置了 segment B.exit 又调回
+
+只要是 `UPDATE_CONTACT` 改的字段和 segment filter condition 引用的字段有交集，再配上多条 entry/exit 工作流，就可能形成环。
+
+### 现有的断环机制（天然的 + 隐式的）
+
+| 机制 | 位置 | 断环效果 |
+|------|------|---------|
+| **周期触发天然去抖（5 分钟粒度）** | [app.ts L477 cron: */5 \* \* \* \*](file:///d:/fz/0601-1/solo-dogfeeding/code/57-plunk/apps/api/src/app.ts#L477) | 即使形成循环，也只会**每 5 分钟滚动一圈**，不会瞬间卡死数据库。最坏是每 5 分钟每人触发 2~N 条工作流执行。 |
+| **computeMembership 只算差异** | [SegmentService L524-L525](file:///d:/fz/0601-1/solo-dogfeeding/code/57-plunk/apps/api/src/services/SegmentService.ts#L524-L525)：Set diff 算 toAdd/toRemove，**无差异就不触发任何事件**，也不写 DB | 如果 UPDATE_CONTACT 的副作用没真的把 contact 推出/拉入 segment，就不会产生下一轮事件。 |
+| **Segment 条件引用自身做 filter 时的循环保护** | [SegmentService.buildFilterCondition L643-L648](file:///d:/fz/0601-1/solo-dogfeeding/code/57-plunk/apps/api/src/services/SegmentService.ts#L643-L648)：`visitedSegments Set` 遇自身 ID 或环就抛 400 `Circular segment reference detected` | 这是**构建 WHERE 子句时**的 segment → segment 引用保护，只保护"Segment filter 里写了 segment.OTHER_SEGMENT.membership"这种场景。**不保护本问题的"工作流触发的 UPDATE_CONTACT 改了字段"**。 |
+| **Worker 端 rate limiter（60 秒 1 次）** | [segment-count-processor.ts L133-L136](file:///d:/fz/0601-1/solo-dogfeeding/code/57-plunk/apps/api/src/jobs/segment-count-processor.ts#L133-L136)：`max: 1, duration: 60000`（单 Worker 每分钟最多跑一个 count job） | 防止短时间内多条重复的 segment count 入队（例如用户手动点好几次"刷新计数"），但不影响 cron 的每 5 分钟一条节奏。 |
+| **allowReentry=false（需用户显式配置）** | 如果被触发的工作流自身 `allowReentry=false`，则 `startWorkflowForContact` 的 findFirst 检查会命中"历史有过记录"而拒绝再次启动 | 需用户意识到要开；默认创建工作流的 allowReentry 看前端默认值。 |
+
+### 真正的缺口
+
+当前代码**没有任何"事件源标记"能判断这个事件是来自用户 / SES / API / Segment 周期任务**——Event 表模型里没有 `source`/`origin`/`triggeredBy` 字段（查 [schema.prisma L377-L407](file:///d:/fz/0601-1/solo-dogfeeding/code/57-plunk/packages/db/prisma/schema.prisma#L377-L407)）。这导致：
+
+1. 无法在 `triggerWorkflows()` 中**基于 origin 选择性触发**（例如"segment.entry 触发的工作流所产生的后续事件，不再启动任何 segment 型工作流，断环深度=1"）
+2. 无法在审计页面给用户提示"这个工作流执行是由 segment 周期任务启动的，可能形成循环"
+3. 无法做"同一 contact、同一 segment、同一方向（entry/exit）的事件在 X 时间窗内只允许 N 次"的去抖
+
+---
+
+## 二十二、Prisma 连接池：BullMQ 并发 10 + 多副本下的性能上限与拒绝行为
+
+### 连接池配置现状
+
+**[prisma.ts](file:///d:/fz/0601-1/solo-dogfeeding/code/57-plunk/apps/api/src/database/prisma.ts) 极简：**
+
+```typescript
+export const prisma = new PrismaClient();  // 什么参数都没传
+```
+
+DATABASE_URL 在 [.env.example L37](file:///d:/fz/0601-1/solo-dogfeeding/code/57-plunk/apps/api/.env.example#L37) 也**没有 `?connection_limit=N` 参数**：
+
+```
+DATABASE_URL=postgresql://postgres:postgres@localhost:55432/postgres
+```
+
+### Prisma 默认连接池公式
+
+Prisma 默认 `connection_limit = num_physical_cpus * 2 + 1`，常见值：
+
+| CPU 核数 | 默认 connection_limit |
+|---------|----------------------|
+| 2 核 | 5 |
+| 4 核 | 9 |
+| 8 核 | **17** ← 最常见的生产节点 |
+| 16 核 | 33 |
+
+且所有模块**共用同个 PrismaClient 单例**：
+- HTTP controllers（Webhooks、Contacts、Campaigns、Actions…）
+- 所有 Services（EventService、WorkflowExecutionService、SegmentService、EmailService…）
+- 所有 Worker processors（email / workflow / scheduled / import / segment-count / domain-verification / bulk-contact / cleanup）
+
+**单进程的并发 Prisma 查询消费者合计数：**
+
+| 组件 | 并发数 | 典型查询数/任务 |
+|------|-------|---------------|
+| HTTP 入口（Express） | 无硬限，看 Node.js 压力（假设 ~50 RPS 下约 20 条 in-flight 请求） | 每个请求 1~10 次 prisma 调用 |
+| workflow-processor Worker | `concurrency: 10` | **单个 workflow 步骤 = 15~40 次 prisma**（findFirst execution → include transitions → find contact → create/update stepExecution → renderTemplate → executeStep（各步骤自己的 DB 操作）→ processNextSteps → update execution → processNextSteps 递归） |
+| email-processor Worker | 未在代码里显式设（默认 1？需查看配置） | 每封邮件约 3~8 次（get template + get contact + 创建 Email 行 + SES send + 更新状态） |
+| scheduled-processor Worker | 默认 1 | 批量调度，扫描量大 |
+| import-processor Worker | 默认 1 | 批量 upsert，N×M |
+| segment-count Worker | `concurrency: 1` + limiter 60s/次，但 processProjectSegments 内 `Promise.all(batch.map(...))` 并发 10 个项目（[L98-L107](file:///d:/fz/0601-1/solo-dogfeeding/code/57-plunk/apps/api/src/jobs/segment-count-processor.ts#L98-L107)），每个项目里 computeMembership 是"游标扫描 Contact 全表+游标扫 Membership+批量写+循环写 Event"，一个 segment 几十次 prisma 调用 | 一个项目 N 次，10 项目并行 → 瞬间爆发 10×N |
+| domain-verification Worker | 默认 1 | 轻量 |
+| bulk-contact Worker | 默认 1 | 批量 |
+| api-request-cleanup Worker | 默认 1 | 大 DELETE |
+
+### 最坏场景的连接池压力估算（8 核机器，connection_limit=17）
+
+假设：2 个 Worker 副本 + 3 个 API 副本 = 5 个 Node 进程
+
+**每个进程独立拥有自己的 Prisma 连接池**（因为 `new PrismaClient()` 是进程级单例）：
+
+```
+PostgreSQL 侧实际最大连接数占用 = 5 进程 × 17 = 85
+                                                    ↑
+  PostgreSQL 默认 max_connections = 100，已经很接近了
+```
+
+而且 **workflow-processor concurrency=10**，一个步骤处理过程中会产生"1 个异步协程 → 多个 prisma 调用 → 多个连接同时被占用"的链式占用。更严重的是 `Promise.all()` 并发模式：
+
+- `WorkflowExecutionService.processNextSteps` 虽然单步串行，但 step 内部（如 executeBulkUpdate）可能有 `Promise.all`
+- segment-count 的 **10 项目并发 × 每项目 computeMembership 多阶段**
+- Contact 批量 upsert
+
+**结果：连接池瞬间耗尽 → Prisma 抛出 `Timed out fetching a new connection from the pool`**
+
+### 连接池耗尽时的拒绝行为（三级降级）
+
+| 级别 | 触发条件 | Prisma 行为 | 对上层的影响 |
+|------|---------|-----------|------------|
+| L1 排队等待 | 连接池满但请求数 ≤ pool_timeout（默认 10s）内会被处理 | Prisma 在内部等待队列排队 | 所有 prisma 调用变慢，HTTP 响应超时，BullMQ 处理超时进入 stall |
+| L2 PoolTimeoutError | 单条 prisma 查询等连接超过 pool_timeout | 抛 `PrismaClientInitializationError` / `Timed out fetching...` | 业务 catch 块：Workflow 步骤抛错 → FAILED（[WorkflowExecutionService L257-L288](file:///d:/fz/0601-1/solo-dogfeeding/code/57-plunk/apps/api/src/services/WorkflowExecutionService.ts#L257-L288) catch 分支 → Ntfy 通知 + 步骤 FAILED） |
+| L3 雪崩（PostgreSQL 侧 Too many connections） | 所有进程连接池之和超过 PostgreSQL `max_connections` | PostgreSQL 拒绝新的 TCP 握手，Prisma 报 `FATAL: sorry, too many clients already` | 所有模块的所有查询全挂；HTTP 500；BullMQ stall → stalled 重试 → 进一步放大 |
+
+### 现有的隐性兜底
+
+| 兜底手段 | 位置 | 缓解维度 |
+|---------|------|---------|
+| **Email Worker 并发可配置** | [.env.example L68-L77](file:///d:/fz/0601-1/solo-dogfeeding/code/57-plunk/apps/api/.env.example#L68-L77)：`EMAIL_WORKER_CONCURRENCY` / `EMAIL_WORKER_MAX_CONCURRENCY`（默认值为 rate*0.5，封顶 50） | 邮件侧的连接池占用上限可控 |
+| **Segment Worker rate limiter** | [segment-count-processor.ts L133-L136](file:///d:/fz/0601-1/solo-dogfeeding/code/57-plunk/apps/api/src/jobs/segment-count-processor.ts#L133-L136)：60s 1 次 + processProjectSegments **L110-L112** 2 秒 batch 间隔 | 防止 segment 任务持续霸占连接 |
+| **BullMQ attempts=3 + 指数退避** | [QueueService L77-L83](file:///d:/fz/0601-1/solo-dogfeeding/code/57-plunk/apps/api/src/services/QueueService.ts#L77-L83) | 因连接池耗尽而 FAILED 的步骤，BullMQ 会在 2s/4s/8s 后重试，等其他步骤释放连接 |
+| **SNS 入口永远 200 OK** | [Webhooks L472-L476](file:///d:/fz/0601-1/solo-dogfeeding/code/57-plunk/apps/api/src/controllers/Webhooks.ts#L472-L476) | HTTP 侧 Prisma 挂了不会让 SNS 重试风暴叠加上来 |
+
+### 缺失的连接池治理能力
+
+1. **DATABASE_URL 未显式配置 `connection_limit` 和 `pool_timeout`**：生产部署时依赖 Prisma 默认值，不同 CPU 的机器结果不同，且"业务峰值需要多少连接"没有经过压测建模
+2. **未配置 `?pgbouncer=true`**：如果生产环境配了 PgBouncer，需要显式告诉 Prisma 使用事务级池模式
+3. **没有 DB 级查询超时/statement_timeout**：单次慢查询（segment 全表扫 + 多 join）霸占连接不释放，其他查询排队等死
+4. **进程间不共享连接池**：N 副本 = N 倍连接占用，副本数多了容易打 PostgreSQL max_connections
+5. **Workflow 步骤执行无连接获取限流**：当 L2 PoolTimeoutError 反复出现时，没有"主动减载"——应该让 workflow processor 短暂退避或把 job 放回 waiting 队列，而不是不断 retry 继续占满队列
