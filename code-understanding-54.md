@@ -661,14 +661,90 @@ try {
 }
 ```
 
-### 6.2 BullMQ 自动重试
-- 队列配置 `attempts: 3`，步骤执行失败会自动重试
-- 重试间隔：指数退避（2s, 4s, 8s...）
-- **注意**：重试时会再次执行整个 `processStepExecution()`，包括：
-  - 重新查询 Execution 状态
-  - 重新创建/更新 StepExecution
-  - 重新执行步骤逻辑
-- 已标记为 FAILED 的 Execution 不会被重试（状态检查会直接返回）
+### 6.2 BullMQ 自动重试与副作用重复深度分析
+
+**队列与重试配置**：
+- 队列：`workflowQueue`（BullMQ，基于 Redis）
+- 尝试次数：`attempts: 3`（最多执行 3 次，首次 + 2 次重试）
+- 退避策略：指数退避，`delay: 2000ms`（2s → 4s → 8s）
+- Worker 并发：`concurrency: 10`（单进程并发处理 10 个 job）
+- 代码依据：[QueueService.ts#L73-L84](file:///d:/fz/0601-1/solo-dogfeeding/code/54-plunk/apps/api/src/services/QueueService.ts#L73-L84)、[workflow-processor-queue.ts#L13-L35](file:///d:/fz/0601-1/solo-dogfeeding/code/54-plunk/apps/api/src/jobs/workflow-processor-queue.ts#L13-L35)
+
+**重试触发的完整调用链**：
+```
+BullMQ Worker (concurrency: 10)
+  └─ job.type === 'process-step'
+      └─ WorkflowExecutionService.processStepExecution(executionId, stepId)
+          │
+          ├─ ✅ 成功 → worker.completed
+          └─ ❌ 抛出未捕获异常 → worker.failed → BullMQ 调度重试
+              └─ 退避 delay 后，worker 再次调用 processStepExecution()
+```
+
+**两种失败路径：重试是否有效**
+
+| 失败场景 | Execution 状态 | 重试结果 | 副作用是否重复 |
+|---------|---------------|---------|--------------|
+| **路径 A：catch 块成功执行** | `FAILED` | ❌ 无效（状态检查拦截） | 不重复 |
+| **路径 B：catch 块也失败（数据库全挂等）** | 仍为 `RUNNING` | ✅ 有效，完整重跑 | **全部重复** |
+
+**路径 A（常见路径）—— catch 块成功标记 FAILED**：
+```
+processStepExecution()
+  try {
+    executeStep()        // 副作用已发生：发了邮件 / 调了 webhook / 改了联系人
+    └─ 后续数据库操作失败（写 output 等）
+  } catch (error) {
+    prisma.workflowStepExecution.update({ status: FAILED })   // ✅ 成功
+    prisma.workflowExecution.update({ status: FAILED })       // ✅ 成功
+    NtfyService.notify(...)                                   // ✅ 成功
+    throw error;  // 抛出给 BullMQ
+  }
+
+BullMQ 重试 → 再次调用 processStepExecution()
+  └─ 第 84 行检查 initialExecution.status === FAILED → 直接 return
+```
+→ 重试被状态检查拦住，副作用不会重复，但步骤已标记为 FAILED（虽然实际已执行）。
+代码依据：[WorkflowExecutionService.ts#L254-L298](file:///d:/fz/0601-1/solo-dogfeeding/code/54-plunk/apps/api/src/services/WorkflowExecutionService.ts#L254-L298)、[L80-L89](file:///d:/fz/0601-1/solo-dogfeeding/code/54-plunk/apps/api/src/services/WorkflowExecutionService.ts#L80-L89)
+
+**路径 B（极端路径）—— catch 块自身也失败**：
+```
+processStepExecution()
+  try {
+    executeStep()        // ✅ 副作用已发生：
+                         //   - SEND_EMAIL：EmailService.sendWorkflowEmail() 已写 Email 记录 + 已入队发送
+                         //   - WEBHOOK：HTTP 请求已到达对端，对端已 commit
+                         //   - UPDATE_CONTACT：prisma.contact.update() 已写库 + 订阅事件已触发
+    writeOutput()        // ❌ 数据库瞬断，写失败
+  } catch (error) {
+    prisma.workflowStepExecution.update({ status: FAILED })  // ❌ 数据库还挂着
+    prisma.workflowExecution.update({ status: FAILED })      // ❌ 也失败
+    throw error;  // 错误直接冒泡到 BullMQ worker
+  }
+
+// 此时 Execution 状态仍为 RUNNING（catch 里的更新没成功）
+
+BullMQ 重试 → 再次调用 processStepExecution()
+  └─ 第 84 行检查 status === RUNNING → 继续执行
+      └─ 重新执行 executeStep() → 副作用全部再跑一遍！
+          - SEND_EMAIL：再写一条 Email 记录 + 再发一封（可能重复收到）
+          - WEBHOOK：再调一次 HTTP（对端非幂等的话数据重复）
+          - UPDATE_CONTACT：再改一次联系人 + 再触发一次订阅事件 → 级联 workflow 再启动一遍
+```
+
+**关键洞见**：
+- 重试的"有效前提"是 **catch 块的数据库更新失败**，此时 Execution 状态停留在 RUNNING
+- 正常情况下 catch 块能成功标记 FAILED，重试会被状态检查拦住
+- 但数据库故障是"整片区域"的——写 output 失败时，catch 里的状态更新大概率也失败
+- 因此**数据库瞬断场景下，重试几乎必然导致副作用重复**
+
+**哪些步骤入队才会触发重试？**
+- ❌ 启动时的同步递归链（startExecution → processStepExecution → processNextSteps）不走队列，失败了就是失败，没有重试
+- ✅ DELAY 之后的下一步通过 `queueWorkflowStep()` 入队，有重试
+- ✅ WAIT_FOR_EVENT 超时通过 `queueWorkflowTimeout()` 入队，有重试
+- ✅ handleEvent 唤醒后的同步链也不走队列，但如果后续遇到 DELAY 又入队，后面的步骤就有重试
+
+代码依据：[QueueService.ts#L230-L262](file:///d:/fz/0601-1/solo-dogfeeding/code/54-plunk/apps/api/src/services/QueueService.ts#L230-L262)
 
 ### 6.3 项目禁用处理
 [processStepExecution()](file:///d:/fz/0601-1/solo-dogfeeding/code/54-plunk/apps/api/src/services/WorkflowExecutionService.ts#L92-L105)
@@ -969,6 +1045,10 @@ PENDING → RUNNING ─┬─ 成功 → COMPLETED
 | 变量展开覆盖 | SEND_EMAIL/WEBHOOK 的 variables 浅展开可能被 contact.data 或 context 覆盖系统变量 |
 | 未知操作符硬错误 | CONDITION 配置错误操作符直接抛错，标记 FAILED |
 | 上下文只读 | execution.context 启动后不再更新，新唤醒事件数据仅存 StepExecution.output |
+| 模板 `||` 假值短路 | 0、""、false 等假值被 `||` 短路，无法正常显示 |
+| 重试副作用重复 | BullMQ 重试会完整重跑 executeStep，邮件/webhook/订阅事件全部重复 |
+| 跨 workflow 无锁 | 同一联系人可同时进入多个 workflow，无互斥机制 |
+| 数组自动包 li | 模板数组值被强制转为 HTML `<li>` 列表，无法作为普通字符串 |
 
 ### 易误判点速查
 | 行为 | 实际表现 |
