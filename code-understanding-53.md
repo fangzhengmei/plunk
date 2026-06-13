@@ -140,7 +140,7 @@ CSV 表头 → 全部 toLowerCase() → 作为 record 的 key
 - **Segment 表**: [schema.prisma](file:///d:/fz/0601-1/solo-dogfeeding/code/53-plunk/packages/db/prisma/schema.prisma) 第 196-251 行
   - `type`: `DYNAMIC`（动态筛选）或 `STATIC`（静态手动管理）
   - `condition`: JSON 格式的筛选条件（仅 DYNAMIC）
-  - `trackMembership`: 是否追踪成员变化（启用后生成 entry/exit 事件）
+  - `trackMembership`: 是否启用 membership 跟踪链路（DYNAMIC 会走 computeMembership 重算；STATIC 即使开启也不会生成 entry/exit 事件）
   - `memberCount`: 缓存的成员数量
 
 - **SegmentMembership 表**: 第 253-274 行
@@ -227,8 +227,9 @@ segment-count-processor.ts → processSegmentCountUpdate()
          ▼
     processProjectSegments(projectId)
          │
-         ├─ trackMembership=true  → SegmentService.computeMembership()  重链路
-         │    （全量重算 + 写 membership + entry/exit 事件）
+         ├─ trackMembership=true  → SegmentService.computeMembership()
+         │    （DYNAMIC: 全量重算 + 写 membership + entry/exit 事件）
+         │    （STATIC: 仅 COUNT + 更新 memberCount 后直接 return）
          │
          └─ trackMembership=false → SegmentService.refreshAllMemberCounts()  轻链路
               （仅 COUNT() + 更新 memberCount）
@@ -293,7 +294,7 @@ segment-count-processor.ts → processSegmentCountUpdate()
 - 服务层: `SegmentService.computeMembership(projectId, segmentId)`
 - 位置: [SegmentService.ts](file:///d:/fz/0601-1/solo-dogfeeding/code/53-plunk/apps/api/src/services/SegmentService.ts) 第 449-631 行
 
-#### 完整流程（与定时任务中的重链路完全相同）
+#### 完整流程（仅 DYNAMIC + trackMembership=true，与定时任务中的重链路完全相同）
 
 1. 用游标分页（1000 条/批）获取所有符合条件的 contactId，存入 Set
 2. 用游标分页获取当前活跃成员的 contactId，存入 Set
@@ -309,13 +310,13 @@ segment-count-processor.ts → processSegmentCountUpdate()
 - **单 segment**：只重算指定 ID 的 segment
 - **全量重算**：不管有没有变化，都重新扫描所有联系人
 - **写 membership**：新增/更新 SegmentMembership 记录
-- **触发生成事件**：entry/exit 事件会驱动 Workflow 引擎
+- **触发生成事件**：仅 DYNAMIC + trackMembership=true 会生成 entry/exit 事件并驱动 Workflow 引擎
 - **同步等待**：API 同步调用，大 segment 可能需要几秒甚至几十秒才返回
 
 #### 覆盖场景
 
-- 刚改完 segment 的筛选条件，想立刻让新条件生效并触发相关 workflow
-- 修复了 segment 条件 bug 后，想立刻重算历史成员
+- 刚改完 DYNAMIC segment 的筛选条件，想立刻让新条件生效并触发相关 workflow
+- 修复了 DYNAMIC segment 条件 bug 后，想立刻重算历史成员
 - 紧急营销活动前，确认 segment 成员是最新的并触发必要的自动化流程
 
 ---
@@ -395,7 +396,7 @@ public static async queueSegmentCountUpdate(projectId?: string): Promise<Job<Seg
 | STATIC segment 添加成员后 | [SegmentService.addContacts](file:///d:/fz/0601-1/solo-dogfeeding/code/53-plunk/apps/api/src/services/SegmentService.ts#L331-L404) 第 399 行 | `COUNT(membership)` 更新 memberCount |
 | STATIC segment 移除成员后 | [SegmentService.removeContacts](file:///d:/fz/0601-1/solo-dogfeeding/code/53-plunk/apps/api/src/services/SegmentService.ts#L409-L443) 第 438 行 | `COUNT(membership)` 更新 memberCount |
 
-> 注意：创建/修改 segment 时只做 `COUNT()` 更新 memberCount，**不做** `computeMembership()` 全量重算。也就是说新 segment 即使开了 trackMembership，也需要等到下次定时轮询或手动 compute 时才会生成 membership 记录和 entry/exit 事件。
+> 注意：创建/修改 segment 时只做 `COUNT()` 更新 memberCount，**不做** `computeMembership()` 全量重算。也就是说新建或修改后的 **DYNAMIC + trackMembership=true** segment，仍要等到下次定时轮询或手动 compute 才会生成 membership 记录和 entry/exit 事件；STATIC segment 不适用这条事件链路。
 
 ---
 
@@ -454,18 +455,19 @@ T=5min+ Segment 数据与导入结果一致（视项目大小和 segment 数量�
 ```
 processProjectSegments(projectId)
     │
-    ├─ trackMembership=true  →  computeMembership()   （重链路）
+    ├─ trackMembership=true  →  computeMembership()
+    │                          （DYNAMIC: 重链路；STATIC: count-only 短路）
     │
     └─ trackMembership=false →  refreshAllMemberCounts()  （轻链路）
 ```
 
-| 维度 | `refreshAllMemberCounts()` 轻链路 | `computeMembership()` 重链路 |
+| 维度 | `refreshAllMemberCounts()` 轻链路 | `computeMembership()`（DYNAMIC 重链路 / STATIC count-only） |
 |-----|----------------------------------|------------------------------|
 | **位置** | [SegmentService.ts](file:///d:/fz/0601-1/solo-dogfeeding/code/53-plunk/apps/api/src/services/SegmentService.ts#L290-L326) | [SegmentService.ts](file:///d:/fz/0601-1/solo-dogfeeding/code/53-plunk/apps/api/src/services/SegmentService.ts#L449-L631) |
-| **DB 读取量** | 每个 segment 1 次 `COUNT()` 查询（用 GIN 索引走 jsonb 条件） | 2 次游标全表扫描：<br>① 所有匹配条件的 contactId（1000 条/批）<br>② 所有活跃 membership contactId（1000 条/批） |
-| **内存占用** | 几乎为 0（COUNT 结果单个数字） | 两个 Set，大小等于「匹配人数」和「当前成员数」（最坏 O(N)） |
-| **DB 写入量** | 每个 segment 1 次 `UPDATE segment SET memberCount` | 每有一个变动：<br>① INSERT/UPDATE SegmentMembership（500/批）<br>② INSERT Event（**逐条**，每个进出都有 entry/exit 事件） |
-| **生成产物** | 仅 `segment.memberCount`（一个数字） | ① `SegmentMembership` 记录（精确历史，含 enteredAt/exitedAt）<br>② `segment.<name>.entry` 和 `segment.<name>.exit` 事件 |
+| **DB 读取量** | 每个 segment 1 次 `COUNT()` 查询（用 GIN 索引走 jsonb 条件） | DYNAMIC: 2 次游标全表扫描：<br>① 所有匹配条件的 contactId（1000 条/批）<br>② 所有活跃 membership contactId（1000 条/批）<br>STATIC: 1 次 membership `COUNT()` |
+| **内存占用** | 几乎为 0（COUNT 结果单个数字） | DYNAMIC: 两个 Set，大小等于「匹配人数」和「当前成员数」（最坏 O(N)）<br>STATIC: 几乎为 0 |
+| **DB 写入量** | 每个 segment 1 次 `UPDATE segment SET memberCount` | DYNAMIC 每有一个变动：<br>① INSERT/UPDATE SegmentMembership（500/批）<br>② INSERT Event（**逐条**，每个进出都有 entry/exit 事件）<br>STATIC: 仅 1 次 `UPDATE segment SET memberCount` |
+| **生成产物** | 仅 `segment.memberCount`（一个数字） | DYNAMIC: ① `SegmentMembership` 记录（精确历史，含 enteredAt/exitedAt）<br>② `segment.<name>.entry` 和 `segment.<name>.exit` 事件<br>STATIC: 仅更新 `segment.memberCount` |
 | **典型耗时** | 每项目 ~几百 ms（10 个 segment 以内） | 数万联系人的项目可达数秒至数十秒 |
 
 #### 为什么需要重链路？三个关键能力
@@ -663,10 +665,11 @@ FilterCondition (上面的 JSON)
 
 **导入后生效时间**：
 
-| trackMembership | 导入后 memberCount 何时更新 |
-|-----------------|---------------------------|
-| false | 下次定时轮询（≤5min）执行 `refreshAllMemberCounts()` 时 |
-| true | 下次定时轮询执行 `computeMembership()` 时（末尾会更新 memberCount） |
+| segment 类型 / 配置 | 导入后 memberCount 何时更新 |
+|----------------------|---------------------------|
+| DYNAMIC + trackMembership=false | 下次定时轮询（≤5min）执行 `refreshAllMemberCounts()` 时 |
+| DYNAMIC + trackMembership=true | 下次定时轮询执行 `computeMembership()` 时（末尾会更新 memberCount） |
+| STATIC（任何 trackMembership） | 导入 contact 本身**不会**改变 STATIC membership，因此 memberCount 不受这次导入影响 |
 | 手动 refresh 后 | 立即（`POST /segments/:id/refresh`） |
 
 **关键结论：导入后 segment 列表页的数字不会立刻变化，必须等定时轮询或手动刷新。**
@@ -742,12 +745,16 @@ DYNAMIC segment
 
 这是一个**延迟生效**的场景，依赖完整的重链路执行。
 
-#### 事件产生路径
+#### 事件产生路径（仅 DYNAMIC + trackMembership=true）
 
 ```
 定时轮询 / 手动 compute
     │
     ▼  SegmentService.computeMembership()
+    │  ⚠ STATIC segment 在此方法中只做 COUNT，直接 return，不产生事件
+    │  ⚠ trackMembership=false 的 segment 在入口处直接 throw，无法调用
+    │
+    │  （以下仅 DYNAMIC + trackMembership=true）
     │  计算差集 → toAdd / toRemove
     │
     ├─ toAdd 中的每个 contactId:
@@ -777,44 +784,181 @@ DYNAMIC segment
 
 | 条件 | 事件何时产生 | Workflow 何时触发 |
 |------|------------|------------------|
-| segment.trackMembership=false | **永远不会**产生 entry/exit 事件 | 永远不会触发 |
-| segment.trackMembership=true + 等定时轮询 | ≤5 分钟后定时轮询执行 computeMembership() 时 | ≤5 分钟后 |
-| segment.trackMembership=true + 手动 compute | 调用 `POST /segments/:id/compute` 后立即 | 立即（同步调用） |
-| segment.trackMembership=true + 手动 refresh | **不会触发**！refreshMemberCount 只做 COUNT，不执行 computeMembership | 不触发 |
+| DYNAMIC + trackMembership=false | **永远不会**产生 entry/exit 事件 | 永远不会触发 |
+| DYNAMIC + trackMembership=true + 等定时轮询 | ≤5 分钟后定时轮询执行 computeMembership() 时 | ≤5 分钟后 |
+| DYNAMIC + trackMembership=true + 手动 compute | 调用 `POST /segments/:id/compute` 后立即 | 立即（同步调用） |
+| DYNAMIC + trackMembership=true + 手动 refresh | **不会触发**！refreshMemberCount 只做 COUNT，不执行 computeMembership | 不触发 |
+| **STATIC（任何 trackMembership）** | **永远不会**产生 entry/exit 事件 | **永远不会触发** |
 
-**关键结论：Workflow 是受 5 分钟延迟影响最大的场景。即使 segment 是 DYNAMIC 且联系人页/campaign 已能看到新数据，Workflow 仍需等到 computeMembership() 执行后才会触发。且仅 trackMembership=true 的 segment 才会产生事件。**
+**关键结论：Workflow 是受 5 分钟延迟影响最大的场景。即使 segment 是 DYNAMIC 且联系人页/campaign 已能看到新数据，Workflow 仍需等到 computeMembership() 执行后才会触发。且仅 DYNAMIC + trackMembership=true 的 segment 才会产生事件。STATIC segment 永远不会产生 entry/exit 事件。**
 
 ---
 
-### 7.5 消费侧生效时间总表
+### 7.5 STATIC Segment 深度核对：三件事分别由谁负责
 
-| 消费场景 | 读取的数据源 | DYNAMIC segment 导入后何时生效 | STATIC segment 导入后何时生效 |
+之前的分析在 STATIC segment 的事件触发上存在错误结论。以下逐行核对代码，把 membership 变更、memberCount 变化和事件触发三件事拆开讲清。
+
+#### 三件事的独立性
+
+| 事件 | addContacts | removeContacts | computeMembership | 定时轮询 |
+|-----|-------------|----------------|-------------------|---------|
+| **membership 记录变更** | ✅ createMany / updateMany | ✅ updateMany(soft delete) | ❌ 仅 COUNT，不改动 | ❌ 不处理 STATIC |
+| **memberCount 更新** | ✅ 立即 COUNT+UPDATE | ✅ 立即 COUNT+UPDATE | ✅ 仅 COUNT+UPDATE | ✅ refreshAllMemberCounts |
+| **entry/exit 事件** | ❌ **不产生** | ❌ **不产生** | ❌ **不产生**（STATIC 直接 return） | ❌ 不处理 STATIC |
+
+#### 证据一：addContacts 不产生 entry 事件
+
+位置: [SegmentService.addContacts](file:///d:/fz/0601-1/solo-dogfeeding/code/53-plunk/apps/api/src/services/SegmentService.ts#L331-L404)
+
+逐行追踪 addContacts 的完整流程：
+```
+L338   const segment = await this.get(projectId, segmentId);
+L340   if (segment.type !== 'STATIC') throw ...  ← 仅允许 STATIC
+
+L345   contacts = await prisma.contact.findMany(...)  ← 查联系人
+L357   if (createMissing) prisma.contact.createMany(...)  ← 可选创建缺失联系人
+
+L373   if (contacts.length > 0) {
+L375     existingMemberships = await prisma.segmentMembership.findMany(...)  ← 查已有 membership
+L381     newContactIds = 不在已有 membership 中的联系人
+L382     reEntryIds = 已有 membership 但已退出的联系人
+
+L384     if (newContactIds.length > 0)
+L385       prisma.segmentMembership.createMany(...)  ← 创建新 membership
+L391     if (reEntryIds.length > 0)
+L392       prisma.segmentMembership.updateMany(...) ← 重激活（exitedAt = null）
+
+L399     memberCount = COUNT(segmentMembership WHERE exitedAt IS NULL)
+L400     prisma.segment.update({ memberCount })  ← 更新计数
+L401   }
+
+L403   return {added, created, notFound};  ← 结束，无任何事件调用
+```
+
+**结论：addContacts 只做三件事——创建/重激活 membership 记录、更新 memberCount、返回结果。全程零调用 EventService.trackEvent。**
+
+#### 证据二：removeContacts 不产生 exit 事件
+
+位置: [SegmentService.removeContacts](file:///d:/fz/0601-1/solo-dogfeeding/code/53-plunk/apps/api/src/services/SegmentService.ts#L409-L443)
+
+```
+L414   const segment = await this.get(projectId, segmentId);
+L416   if (segment.type !== 'STATIC') throw ...  ← 仅允许 STATIC
+
+L421   contacts = await prisma.contact.findMany(...)  ← 查联系人
+
+L429   if (contacts.length > 0) {
+L432     prisma.segmentMembership.updateMany({
+         where: {segmentId, contactId: {in: contactIds}, exitedAt: null},
+         data: {exitedAt: new Date()}  ← 软删除（设 exitedAt）
+       })
+
+L438     memberCount = COUNT(segmentMembership WHERE exitedAt IS NULL)
+L439     prisma.segment.update({ memberCount })  ← 更新计数
+L440   }
+
+L442   return {removed: contacts.length};  ← 结束，无任何事件调用
+```
+
+**结论：removeContacts 只做两件事——软删除 membership（设 exitedAt）、更新 memberCount。全程零调用 EventService.trackEvent。**
+
+#### 证据三：computeMembership 对 STATIC 直接 return，不产生事件
+
+位置: [SegmentService.computeMembership](file:///d:/fz/0601-1/solo-dogfeeding/code/53-plunk/apps/api/src/services/SegmentService.ts#L449-L464)
+
+```
+L449   public static async computeMembership(...) {
+L453     const segment = await this.get(projectId, segmentId);
+
+L455     if (!segment.trackMembership) {
+L456       throw new HttpException(400, 'Segment does not have membership tracking enabled');
+          ← trackMembership=false 直接拒绝，无法调用
+L457     }
+
+L459     if (segment.type === 'STATIC') {
+L460       // "For static segments, just update the count from memberships — no contact scanning"
+L461       const total = await prisma.segmentMembership.count({where: {segmentId, exitedAt: null}});
+L462       await prisma.segment.update({where: {id: segmentId}, data: {memberCount: total}});
+L463       return {added: 0, removed: 0, total};  ← 直接 return，不进入后续逻辑
+L464     }
+
+         // 以下仅 DYNAMIC + trackMembership=true 才会执行
+         // ... findMany (扫描匹配联系人) ...
+         // ... 差集计算 toAdd / toRemove ...
+         // ... EventService.trackEvent("segment.<slug>.entry") ...
+         // ... EventService.trackEvent("segment.<slug>.exit") ...
+```
+
+**结论：STATIC segment 即使开了 trackMembership，调用 computeMembership 也只做 COUNT + UPDATE memberCount，然后直接 return {added: 0, removed: 0}，不进入差集计算和事件生成逻辑。**
+
+#### 证据四：定时轮询不处理 STATIC segment 的 membership
+
+位置: [segment-count-processor.ts](file:///d:/fz/0601-1/solo-dogfeeding/code/53-plunk/apps/api/src/jobs/segment-count-processor.ts)
+
+定时轮询的处理逻辑：
+```
+processProjectSegments(projectId)
+    ├─ trackedSegments → computeMembership()
+    │    └─ STATIC 进入 computeMembership 后只做 COUNT，不产生事件（见证据三）
+    │
+    └─ nonTrackedSegments → refreshAllMemberCounts()
+         └─ 每个 segment 执行 COUNT + UPDATE memberCount
+            STATIC 和 DYNAMIC 一视同仁，都只更新数字
+```
+
+**结论：定时轮询对 STATIC segment 只更新 memberCount，不改动 membership 记录，不产生事件。**
+
+#### STATIC Segment 全景总结
+
+| 操作 | membership 记录 | memberCount | entry/exit 事件 | Workflow |
+|-----|----------------|------------|----------------|---------|
+| **addContacts** | ✅ 创建/重激活 | ✅ 立即更新 | ❌ 不产生 | ❌ 不触发 |
+| **removeContacts** | ✅ 软删除 | ✅ 立即更新 | ❌ 不产生 | ❌ 不触发 |
+| **computeMembership** | ❌ 不改动 | ✅ 仅 COUNT 更新 | ❌ 不产生（直接 return） | ❌ 不触发 |
+| **定时轮询** | ❌ 不改动 | ✅ COUNT 更新 | ❌ 不产生 | ❌ 不触发 |
+| **refreshMemberCount** | ❌ 不改动 | ✅ COUNT 更新 | ❌ 不产生 | ❌ 不触发 |
+
+> **核心结论：STATIC segment 永远不会产生 `segment.*.entry` 或 `segment.*.exit` 事件，因此也永远不会通过 segment 事件触发 Workflow。** 这是代码层面的硬限制——entry/exit 事件的唯一产生路径在 `computeMembership()` 中，而该方法对 STATIC segment 直接 return。即使 STATIC segment 开启了 trackMembership，事件也不会产生。
+>
+> 这意味着：如果用户想要「手动加人时触发欢迎邮件」的 Workflow，当前架构不支持——Workflow 监听的是 `segment.<slug>.entry` 事件，但 addContacts 不产生这个事件。
+
+---
+
+### 7.6 消费侧生效时间总表（修正版）
+
+| 消费场景 | 读取的数据源 | DYNAMIC segment 导入后何时生效 | STATIC segment 操作后何时生效 |
 |---------|------------|------------------------------|------------------------------|
-| **Segment 列表 memberCount** | 缓存值（segment.memberCount） | ≤5min（定时轮询后） | ≤5min（定时轮询后） |
-| **Segment 联系人页** | DYNAMIC: 实时条件查询<br>STATIC: membership 记录 | **立即** | 手动 addContacts 后 |
-| **Campaign 选人/发送** | 实时条件编译（不读缓存） | **立即** | 手动 addContacts 后 |
-| **Workflow (entry/exit 事件)** | computeMembership() 生成的事件 | trackMembership=true: ≤5min<br>trackMembership=false: 永远不会 | 手动 addContacts 时生成 entry 事件 |
+| **Segment 列表 memberCount** | 缓存值（segment.memberCount） | ≤5min（定时轮询后） | addContacts/removeContacts 后立即；否则 ≤5min |
+| **Segment 联系人页** | DYNAMIC: 实时条件查询<br>STATIC: membership 记录 | **立即** | addContacts/removeContacts 后立即 |
+| **Campaign 选人/发送** | 实时条件编译（不读缓存） | **立即** | addContacts/removeContacts 后立即 |
+| **Workflow (entry/exit 事件)** | computeMembership() 生成的事件 | trackMembership=true: ≤5min<br>trackMembership=false: 永远不会 | **永远不会**（STATIC 不产生 entry/exit 事件） |
 
-### 7.6 一图看懂：导入后数据在各消费侧的可见时间线
+### 7.7 一图看懂：导入后数据在各消费侧的可见时间线
 
 ```
 T=0     导入完成，contact 数据落库
         │
         ├─ DYNAMIC segment 联系人页 ──────── ✅ 立即可见（实时条件查询）
-        ├─ Campaign 创建/发送 ───────────── ✅ 立即可见（实时条件编译）
+        ├─ Campaign 创建/发送(DYNAMIC) ──── ✅ 立即可见（实时条件编译）
         │
         ├─ Segment 列表 memberCount ─────── ❌ 旧值（读缓存）
         ├─ Workflow 触发 ───────────────── ❌ 未触发（需 computeMembership）
         │
+        ├─ STATIC segment 全部 ─────────── ❌ 导入不影响 STATIC（需手动 addContacts）
+        │
 T≤5min  定时轮询触发
         │
-        ├─ trackMembership=false:
+        ├─ DYNAMIC + trackMembership=false:
         │    └─ refreshAllMemberCounts() → memberCount ✅ 更新
         │    └─ Workflow ─────────────── ❌ 不会触发（轻链路不产生事件）
         │
-        └─ trackMembership=true:
+        └─ DYNAMIC + trackMembership=true:
              └─ computeMembership() → memberCount ✅ 更新
              └─ entry/exit 事件 → Workflow ✅ 触发
+
+        └─ STATIC（任何 trackMembership）:
+             └─ computeMembership() → memberCount ✅ 更新（仅 COUNT）
+             └─ 事件 ─────────────── ❌ 永远不产生
 ```
 
 ---
@@ -867,17 +1011,36 @@ T≤5min  定时轮询触发
 │         │                                                            │
 │         │ ┌────────────────────────────────────────────────────────┐ │
 │         │ │  协作关系 B: trackMembership 分叉                      │ │
-│         │ │  ├─ true  → computeMembership() 重链路                │ │
-│         │ │  │    全扫描+差集+写membership+entry/exit事件          │ │
+│         │ │  ├─ true  → computeMembership()                       │ │
+│         │ │  │    DYNAMIC: 全扫描+差集+写membership+entry/exit事件 │ │
+│         │ │  │    STATIC: 仅 COUNT+更新 memberCount               │ │
 │         │ │  └─ false → refreshAllMemberCounts() 轻链路           │ │
 │         │ │       仅 COUNT() + 更新 memberCount                    │ │
 │         │ └────────────────────────────────────────────────────────┘ │
+└──────────────────────────────────────────────────────────────────────┘
+                         │
+                         ▼
+┌──────────────────────────────────────────────────────────────────────┐
+│  7. 消费侧（各场景读取不同数据源 → 导入后生效时间不同）              │
+│                                                                      │
+│  ┌──────────────────┐  数据源: 缓存 memberCount    → ≤5min 生效    │
+│  │ Segment 列表数字  │  [SegmentService.list L33]                   │
+│  └──────────────────┘                                               │
+│  ┌──────────────────┐  数据源: 实时条件查询          → 立即生效    │
+│  │ 联系人页(DYNAMIC) │  [SegmentService.getContacts L62]            │
+│  └──────────────────┘                                               │
+│  ┌──────────────────┐  数据源: 实时条件编译          → 立即生效    │
+│  │ Campaign 选人     │  [CampaignService.buildSegmentWhereAsync]     │
+│  └──────────────────┘                                               │
+│  ┌──────────────────┐  数据源: computeMembership事件 → ≤5min 生效  │
+│  │ Workflow 触发     │  [EventService.triggerWorkflows L348]         │
+│  └──────────────────┘                                               │
 └──────────────────────────────────────────────────────────────────────┘
 ```
 
 ---
 
-## 八、关键文件索引
+## 九、关键文件索引
 
 | 模块 | 文件路径 | 核心职责 |
 |------|---------|---------|
@@ -886,6 +1049,9 @@ T≤5min  定时轮询触发
 | 联系人服务 | [services/ContactService.ts](file:///d:/fz/0601-1/solo-dogfeeding/code/53-plunk/apps/api/src/services/ContactService.ts) | CRUD、upsert、数据合并、字段发现 |
 | 队列服务 | [services/QueueService.ts](file:///d:/fz/0601-1/solo-dogfeeding/code/53-plunk/apps/api/src/services/QueueService.ts) | 所有 BullMQ 队列管理（含 queueSegmentCountUpdate 死代码） |
 | Segment 服务 | [services/SegmentService.ts](file:///d:/fz/0601-1/solo-dogfeeding/code/53-plunk/apps/api/src/services/SegmentService.ts) | Segment CRUD、条件编译、成员计算 |
+| Campaign 服务 | [services/CampaignService.ts](file:///d:/fz/0601-1/solo-dogfeeding/code/53-plunk/apps/api/src/services/CampaignService.ts) | Campaign 创建/发送、实时条件编译选人 |
+| Event 服务 | [services/EventService.ts](file:///d:/fz/0601-1/solo-dogfeeding/code/53-plunk/apps/api/src/services/EventService.ts) | 事件追踪 + Workflow 触发 |
+| Workflow 服务 | [services/WorkflowService.ts](file:///d:/fz/0601-1/solo-dogfeeding/code/53-plunk/apps/api/src/services/WorkflowService.ts) | Workflow CRUD、执行管理 |
 | Segment Worker | [jobs/segment-count-processor.ts](file:///d:/fz/0601-1/solo-dogfeeding/code/53-plunk/apps/api/src/jobs/segment-count-processor.ts) | 定时更新 segment 计数和成员关系 |
 | Segment 控制器 | [controllers/Segments.ts](file:///d:/fz/0601-1/solo-dogfeeding/code/53-plunk/apps/api/src/controllers/Segments.ts) | Segment HTTP 接口（含 refresh/compute） |
 | 应用启动 | [app.ts](file:///d:/fz/0601-1/solo-dogfeeding/code/53-plunk/apps/api/src/app.ts) | 定时任务注册（segment-count repeatable job） |
