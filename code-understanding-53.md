@@ -649,7 +649,177 @@ FilterCondition (上面的 JSON)
 
 ---
 
-## 七、协作环节总览图
+## 七、消费侧代码深度分析：各入口读取的是什么数据？
+
+导入完成后，不同消费场景"看到"新数据的时间点截然不同，根本原因在于它们读取的数据源不同：有的读缓存计数、有的实时编译条件查询、有的依赖 membership 记录和事件。
+
+### 7.1 场景一：Segment 列表页的 memberCount
+
+**数据源：缓存值（segment.memberCount 字段）**
+
+- 代码位置: [SegmentService.list](file:///d:/fz/0601-1/solo-dogfeeding/code/53-plunk/apps/api/src/services/SegmentService.ts#L33-L38)
+- 实现方式: `prisma.segment.findMany({ where: {projectId} })`，直接读 segment 表的 `memberCount` 字段
+- 注释原文（第 31 行）：`Uses cached member counts for performance - counts are updated via background job`
+
+**导入后生效时间**：
+
+| trackMembership | 导入后 memberCount 何时更新 |
+|-----------------|---------------------------|
+| false | 下次定时轮询（≤5min）执行 `refreshAllMemberCounts()` 时 |
+| true | 下次定时轮询执行 `computeMembership()` 时（末尾会更新 memberCount） |
+| 手动 refresh 后 | 立即（`POST /segments/:id/refresh`） |
+
+**关键结论：导入后 segment 列表页的数字不会立刻变化，必须等定时轮询或手动刷新。**
+
+---
+
+### 7.2 场景二：Segment 联系人页
+
+**数据源：按 segment 类型分叉**
+
+- 代码位置: [SegmentService.getContacts](file:///d:/fz/0601-1/solo-dogfeeding/code/53-plunk/apps/api/src/services/SegmentService.ts#L62-L113)
+
+```
+segment.type === 'STATIC'
+    → 查 SegmentMembership 表（WHERE exitedAt IS NULL）
+    → 返回 membership 关联的 contact 列表
+
+segment.type === 'DYNAMIC'
+    → 读 segment.condition → buildWhereClause() 实时编译
+    → prisma.contact.findMany({ where }) 实时查询
+    → 返回匹配的 contact 列表
+```
+
+**导入后生效时间**：
+
+| segment 类型 | 导入后联系人页何时反映新数据 |
+|-------------|---------------------------|
+| DYNAMIC（任何 trackMembership） | **立即**！每次打开页面都实时执行条件查询，导入写入的 contact 数据已落库，条件编译能直接命中 |
+| STATIC | 取决于 membership 记录是否存在。手动 addContacts 后立即可见；定时轮询不会修改 STATIC segment 的 membership |
+
+**关键结论：DYNAMIC segment 的联系人页导入后立即可见新匹配的联系人，不受 5 分钟延迟影响。STATIC segment 依赖手动添加成员。**
+
+---
+
+### 7.3 场景三：Campaign 按 Segment 选人
+
+**数据源：实时条件编译，不读缓存**
+
+- 代码位置: [CampaignService.buildSegmentWhereAsync](file:///d:/fz/0601-1/solo-dogfeeding/code/53-plunk/apps/api/src/services/CampaignService.ts#L835-L868)
+
+```
+STATIC segment
+    → WHERE segmentMemberships: { some: { segmentId, exitedAt: null } }
+    → 读 SegmentMembership 记录
+
+DYNAMIC segment
+    → 读 segment.condition → SegmentService.buildConditionClause()
+    → 实时编译为 contact WHERE 子句
+    → 两种 audienceType:
+        SEGMENT → buildSegmentWhereAsync()
+        FILTERED → 直接用 campaign 上保存的 audienceCondition 编译
+```
+
+**收件人计数也是实时计算**：
+- `getRecipientCount()`（[CampaignService.ts](file:///d:/fz/0601-1/solo-dogfeeding/code/53-plunk/apps/api/src/services/CampaignService.ts#L732-L735)）→ `buildRecipientWhereAsync()` → `prisma.contact.count({ where })`
+- **不使用** segment.memberCount 缓存值
+- 在创建/更新/发送 campaign 时都会重新 COUNT
+
+**导入后生效时间**：
+
+| segment 类型 | 导入后 campaign 选人何时反映新数据 |
+|-------------|----------------------------------|
+| DYNAMIC | **立即**！发送或创建 campaign 时实时编译条件，导入的新联系人已在库中 |
+| STATIC | 取决于 membership 记录。手动 addContacts 后立即可见 |
+
+**关键结论：DYNAMIC segment 的 campaign 发送不受 5 分钟延迟影响——收件人列表是发送时实时计算的。但创建 campaign 时显示的 `totalRecipients` 也是实时 COUNT，所以也是立即准确的。**
+
+---
+
+### 7.4 场景四：Workflow 依赖 membership 事件
+
+**数据源：computeMembership() 生成的 entry/exit 事件**
+
+这是一个**延迟生效**的场景，依赖完整的重链路执行。
+
+#### 事件产生路径
+
+```
+定时轮询 / 手动 compute
+    │
+    ▼  SegmentService.computeMembership()
+    │  计算差集 → toAdd / toRemove
+    │
+    ├─ toAdd 中的每个 contactId:
+    │    └─ EventService.trackEvent(projectId, "segment.<slug>.entry", contactId)
+    │         │  [SegmentService.ts L574-L578]
+    │         ▼
+    │    prisma.event.create({ name: "segment.<slug>.entry", contactId })
+    │         │  [EventService.ts L30-L37]
+    │         ▼
+    │    EventService.triggerWorkflows(projectId, eventName, contactId)
+    │         │  [EventService.ts L41]
+    │         ▼
+    │    查找 triggerConfig.eventName 匹配的 enabled workflow
+    │         │  [EventService.ts L372-L389]
+    │         ▼
+    │    startWorkflowForContact(workflowId, contactId)
+    │         │  [EventService.ts L400]
+    │         ▼
+    │    创建 WorkflowExecution → processStepExecution()
+    │
+    └─ toRemove 中的每个 contactId:
+         └─ EventService.trackEvent(projectId, "segment.<slug>.exit", contactId)
+              → 同样触发匹配的 workflow
+```
+
+#### 导入后生效时间
+
+| 条件 | 事件何时产生 | Workflow 何时触发 |
+|------|------------|------------------|
+| segment.trackMembership=false | **永远不会**产生 entry/exit 事件 | 永远不会触发 |
+| segment.trackMembership=true + 等定时轮询 | ≤5 分钟后定时轮询执行 computeMembership() 时 | ≤5 分钟后 |
+| segment.trackMembership=true + 手动 compute | 调用 `POST /segments/:id/compute` 后立即 | 立即（同步调用） |
+| segment.trackMembership=true + 手动 refresh | **不会触发**！refreshMemberCount 只做 COUNT，不执行 computeMembership | 不触发 |
+
+**关键结论：Workflow 是受 5 分钟延迟影响最大的场景。即使 segment 是 DYNAMIC 且联系人页/campaign 已能看到新数据，Workflow 仍需等到 computeMembership() 执行后才会触发。且仅 trackMembership=true 的 segment 才会产生事件。**
+
+---
+
+### 7.5 消费侧生效时间总表
+
+| 消费场景 | 读取的数据源 | DYNAMIC segment 导入后何时生效 | STATIC segment 导入后何时生效 |
+|---------|------------|------------------------------|------------------------------|
+| **Segment 列表 memberCount** | 缓存值（segment.memberCount） | ≤5min（定时轮询后） | ≤5min（定时轮询后） |
+| **Segment 联系人页** | DYNAMIC: 实时条件查询<br>STATIC: membership 记录 | **立即** | 手动 addContacts 后 |
+| **Campaign 选人/发送** | 实时条件编译（不读缓存） | **立即** | 手动 addContacts 后 |
+| **Workflow (entry/exit 事件)** | computeMembership() 生成的事件 | trackMembership=true: ≤5min<br>trackMembership=false: 永远不会 | 手动 addContacts 时生成 entry 事件 |
+
+### 7.6 一图看懂：导入后数据在各消费侧的可见时间线
+
+```
+T=0     导入完成，contact 数据落库
+        │
+        ├─ DYNAMIC segment 联系人页 ──────── ✅ 立即可见（实时条件查询）
+        ├─ Campaign 创建/发送 ───────────── ✅ 立即可见（实时条件编译）
+        │
+        ├─ Segment 列表 memberCount ─────── ❌ 旧值（读缓存）
+        ├─ Workflow 触发 ───────────────── ❌ 未触发（需 computeMembership）
+        │
+T≤5min  定时轮询触发
+        │
+        ├─ trackMembership=false:
+        │    └─ refreshAllMemberCounts() → memberCount ✅ 更新
+        │    └─ Workflow ─────────────── ❌ 不会触发（轻链路不产生事件）
+        │
+        └─ trackMembership=true:
+             └─ computeMembership() → memberCount ✅ 更新
+             └─ entry/exit 事件 → Workflow ✅ 触发
+```
+
+---
+
+## 八、协作环节总览图
 
 ```
 ┌──────────────────────────────────────────────────────────────────────┐
