@@ -42,8 +42,11 @@ model Workflow {
 ```
 
 **关键字段解读**：
-- `triggerType`: 触发类型，目前主要使用 `EVENT`（事件触发）
-- `triggerConfig`: 触发配置，如 `{eventName: "user.signup"}`
+- `triggerType`: 触发类型，枚举值 `EVENT | MANUAL | SCHEDULE`
+  - `EVENT`: 事件触发（已实现，主路径）
+  - `MANUAL`: 手动 API 触发（已实现）
+  - `SCHEDULE`: 定时调度触发（**已声明未实现**，仅有枚举值和 schema 注释，无调度执行逻辑）
+- `triggerConfig`: 触发配置，如 `{eventName: "user.signup"}` 或注释中的 `{schedule: "0 9 * * *"}`
 - `allowReentry`: 是否允许同一联系人重复进入工作流
   - `false`: 联系人一旦执行过（无论最终状态），永远不能再进入
   - `true`: 联系人可以重复进入，但同一时间只能有一个 `RUNNING` 实例
@@ -116,6 +119,13 @@ model WorkflowExecution {
 | `EXITED` | 通过 EXIT 步骤提前退出 |
 | `FAILED` | 执行失败 |
 | `CANCELLED` | 被用户手动取消 |
+
+**exitReason 取值来源**：
+- `EXECUTED`: 正常完成（空值，不设置 exitReason）
+- `EXITED`: 通过 EXIT 步骤退出，取 step.config.reason，默认 `"exit_step"`
+- `CANCELLED`: 用户手动取消，值为 `"Cancelled by user"` 或 `"Cancelled by user (bulk cancel)"`
+- `CANCELLED`（项目禁用）: 值为 `"Project disabled"`
+- `FAILED`: 执行失败，不设置 exitReason，错误信息在 stepExecution.error 中
 
 #### WorkflowStepExecution（单步执行记录）
 [schema.prisma#L475-L511](file:///d:/fz/0601-1/solo-dogfeeding/code/54-plunk/packages/db/prisma/schema.prisma#L475-L511)
@@ -203,12 +213,23 @@ model WorkflowStepExecution {
 **WEBHOOK 配置**：
 ```typescript
 {
-  url: string;                  // Webhook URL
-  method: 'GET' | 'POST' | 'PUT' | 'PATCH' | 'DELETE';  // 默认 POST
-  headers?: Record<string, string>;
-  body?: Json;                  // 请求体（支持模板变量）
+  url: string;                  // Webhook URL（支持模板变量渲染）
+  method: 'GET' | 'POST' | 'PUT' | 'PATCH' | 'DELETE';  // 默认 POST，不参与模板渲染
+  headers?: Record<string, string>;  // header 值支持模板变量渲染
+  body?: Json;                  // 请求体（支持模板变量深度渲染）
 }
 ```
+
+**WEBHOOK 模板变量域**：
+变量 scope 是 SEND_EMAIL scope 的超集，包含：
+- `id`, `email` — 联系人 ID 和邮箱
+- `data` / 顶层展开的联系人属性 — 联系人自定义数据
+- 执行上下文数据（execution context）
+- `event` — 触发工作流的事件载荷（WEBHOOK 独有）
+- `unsubscribeUrl`, `subscribeUrl`, `manageUrl` — 订阅管理链接
+
+**注意**：`method` 字段**不参与模板渲染**，始终作为字面 HTTP 动词使用，防止模板注入导致的非预期请求方法。
+代码依据：[WorkflowExecutionService.ts#L940-L954](file:///d:/fz/0601-1/solo-dogfeeding/code/54-plunk/apps/api/src/services/WorkflowExecutionService.ts#L940-L954)
 
 **UPDATE_CONTACT 配置**：
 ```typescript
@@ -258,6 +279,12 @@ API 请求 → startExecution()
   ├─ 创建 WorkflowExecution (status=RUNNING)
   └─ 异步调用 processStepExecution()（不 await）
 ```
+
+#### 方式 3：定时调度触发（未实现）
+- `WorkflowTriggerType.SCHEDULE` 枚举值已在 schema 中声明
+- `triggerConfig` 注释中提及 `{ schedule: "0 9 * * *" }` 格式
+- **实际无任何调度执行逻辑**：没有 cron 调度器、没有定时扫描任务、没有对应的队列 worker
+- 代码依据：[schema.prisma#L681-L685](file:///d:/fz/0601-1/solo-dogfeeding/code/54-plunk/packages/db/prisma/schema.prisma#L681-L685)
 
 ### 3.2 Re-entry 规则详解
 [WorkflowService.startExecution()](file:///d:/fz/0601-1/solo-dogfeeding/code/54-plunk/apps/api/src/services/WorkflowService.ts#L886-L914)
@@ -351,6 +378,19 @@ processStepExecution(executionId, stepId)
 
 > **注意**：`evaluateTransitionCondition()` 当前始终返回 `false`，只有 branch 匹配和无条件转移生效。
 
+### 4.4 同步递归长链的事务超时风险
+
+**执行模型**：`processNextSteps()` → `processStepExecution()` → `executeStep()` → `processNextSteps()` 形成**同步递归调用链**。
+- 没有分拆事务，没有队列投递，没有异步切分
+- 一长串同步步骤（如 TRIGGER → CONDITION → UPDATE_CONTACT → CONDITION → SEND_EMAIL）会在同一个调用栈内连续执行
+- 每个步骤独立更新数据库，但整体调用链是同步阻塞的
+
+**风险点**：
+- 步骤数多、外部调用慢（WEBHOOK、邮件发送）时，单请求/单任务耗时可能过长
+- 可能触及 HTTP 请求超时、数据库连接池占用时间过长等边界问题
+- 仅在遇到 `DELAY` 或 `WAIT_FOR_EVENT` 步骤时才会中断同步链，通过队列异步推进
+- 代码依据：[WorkflowExecutionService.ts#L1165-L1168](file:///d:/fz/0601-1/solo-dogfeeding/code/54-plunk/apps/api/src/services/WorkflowExecutionService.ts#L1165-L1168)
+
 ---
 
 ## 五、异步与延迟边界
@@ -368,6 +408,17 @@ executeDelay()
   └─ QueueService.queueWorkflowStep(executionId, nextStepId, delayMs)
       └─ 加入 BullMQ 队列，延迟 delayMs 后执行
 ```
+
+**延迟上限**：
+- Schema 层面限制最大 365 天
+- 按单位分别校验：`minutes` ≤ 525600，`hours` ≤ 8760，`days` ≤ 365
+- 代码依据：[index.ts#L277-L292](file:///d:/fz/0601-1/solo-dogfeeding/code/54-plunk/packages/shared/src/schemas/index.ts#L277-L292)
+
+**时区问题**：
+- 延迟计算使用 `Date.now() + delayMs`，基于服务器本地时间的毫秒时间戳
+- **不涉及时区转换**，也不考虑夏令时、工作日/自然日等语义
+- 如果配置为 "1 day"，实际是精确的 24 × 60 × 60 × 1000 毫秒，而非日历意义上的「一天」
+- 代码依据：[WorkflowExecutionService.ts#L606-L623](file:///d:/fz/0601-1/solo-dogfeeding/code/54-plunk/apps/api/src/services/WorkflowExecutionService.ts#L606-L623)
 
 **队列消费**：
 - Worker: [createWorkflowWorker()](file:///d:/fz/0601-1/solo-dogfeeding/code/54-plunk/apps/api/src/jobs/workflow-processor-queue.ts#L13-L50)
@@ -433,7 +484,7 @@ BullMQ 超时任务到期 → processTimeout(executionId, stepId, stepExecutionI
 
 ---
 
-## 六、错误恢复机制
+## 六、错误恢复与边界风险
 
 ### 6.1 步骤执行失败
 [processStepExecution() 异常处理](file:///d:/fz/0601-1/solo-dogfeeding/code/54-plunk/apps/api/src/services/WorkflowExecutionService.ts#L254-L298)
@@ -482,6 +533,71 @@ try {
 - 支持最多 5 次重定向
 - 10 秒请求超时
 - 仅允许 http/https 协议
+
+**拦截的 IPv4 网段**：
+| 网段 | 说明 |
+|------|------|
+| `127.0.0.0/8` | 回环地址 |
+| `10.0.0.0/8` | 私有地址 A 类 |
+| `172.16.0.0/12` | 私有地址 B 类 |
+| `192.168.0.0/16` | 私有地址 C 类 |
+| `169.254.0.0/16` | 链路本地 / 云元数据 |
+| `100.64.0.0/10` | 运营商共享地址空间（CGNAT） |
+| `0.0.0.0/8` | 本网络 |
+| `224.0.0.0+` | 组播及以上保留段 |
+
+**拦截的 IPv6 网段**：
+| 前缀 | 说明 |
+|------|------|
+| `::1` | 回环地址 |
+| `fe80:` | 链路本地地址 |
+| `fc:` / `fd:` | 唯一本地地址（ULA） |
+| `ff:` | 组播地址 |
+| `::ffff:` | IPv4 映射地址（会转为 IPv4 校验） |
+
+代码依据：[WorkflowExecutionService.ts#L831-L861](file:///d:/fz/0601-1/solo-dogfeeding/code/54-plunk/apps/api/src/services/WorkflowExecutionService.ts#L831-L861)
+
+### 6.7 事件唤醒的原子性风险
+
+**问题描述**：`handleEvent()` 函数在唤醒 WAIT_FOR_EVENT 步骤时**缺乏事务保护**，存在并发重复推进的风险。
+
+**执行流程**（非原子）：
+```
+1. 查询所有 status=WAITING 的 StepExecution 列表（读）
+2. for 循环逐个处理：
+   a. 更新 StepExecution 为 COMPLETED（写）
+   b. 取消超时任务
+   c. 调用 processNextSteps() 推进（写 + 后续递归）
+```
+
+**风险场景**：
+- 同一事件并发到达（如多次上报、重试风暴），两个请求同时读取到同一个 WAITING 的 StepExecution
+- 两者都会更新为 COMPLETED，并都调用 `processNextSteps()` 推进
+- 可能导致同一个等待步骤被重复推进，产生重复的下游步骤执行（如重复发邮件、重复调用 webhook）
+
+**缓解措施**：
+- 步骤执行的状态更新是独立数据库操作，但整体流程无事务包裹
+- 幂等性依赖后续步骤自身的业务逻辑，而非引擎层面保证
+- 代码依据：[WorkflowExecutionService.ts#L401-L462](file:///d:/fz/0601-1/solo-dogfeeding/code/54-plunk/apps/api/src/services/WorkflowExecutionService.ts#L401-L462)
+
+### 6.8 UPDATE_CONTACT 的订阅副作用
+
+**问题描述**：执行 `UPDATE_CONTACT` 步骤时，如果 `subscriptionAction` 导致订阅状态实际改变，会**触发额外的事件**，可能间接启动其他 workflow。
+
+**副作用链路**：
+```
+executeUpdateContact()
+  ├─ 更新 contact.subscribed 字段
+  └─ 订阅状态变化时 → EventService.trackEvent()
+      ├─ 事件名：contact.subscribed 或 contact.unsubscribed
+      ├─ 该事件可能被其他 Workflow 的 WAIT_FOR_EVENT 步骤捕捉
+      └─ 该事件也可能触发新的 Workflow 启动（triggerType=EVENT 且 eventName 匹配）
+```
+
+**注意**：
+- 这种副作用是隐式的，在 workflow 编排层面不可见
+- 可能引发意料之外的级联触发
+- 代码依据：[WorkflowExecutionService.ts#L1069-L1076](file:///d:/fz/0601-1/solo-dogfeeding/code/54-plunk/apps/api/src/services/WorkflowExecutionService.ts#L1069-L1076)
 
 ---
 
@@ -537,6 +653,48 @@ try {
 **实际**：调用 `processStepExecution()` 时没有 await，异步在后台执行，立即返回 Execution 对象。
 **代码依据**：[WorkflowService.ts#L936-L938](file:///d:/fz/0601-1/solo-dogfeeding/code/54-plunk/apps/api/src/services/WorkflowService.ts#L936-L938)
 
+### ❗ 误判点 11：TRIGGER 步骤的入边与 EXIT 步骤的出边校验
+**误解**：TRIGGER 步骤不允许有入边、EXIT 步骤不允许有出边，系统会强制校验。
+**实际**：代码层面**没有对步骤的入出边数量做强制校验**。TRIGGER 步骤理论上可以接入边，EXIT 步骤理论上可以接出边（但出边永远不会被遍历到，因为 EXIT 步骤执行后直接标记执行结束，不会调用 processNextSteps）。
+- TRIGGER 步骤仅作为执行入口被 `startExecution()` 使用
+- EXIT 步骤执行后直接返回 `{exited: true}`，后续 transition 不会被处理
+**代码依据**：[WorkflowExecutionService.ts#L796-L825](file:///d:/fz/0601-1/solo-dogfeeding/code/54-plunk/apps/api/src/services/WorkflowExecutionService.ts#L796-L825)
+
+### ❗ 误判点 12：exitReason 的取值来源与默认值
+**误解**：exitReason 只有用户取消时才设置，或者所有退出状态都有统一的默认值。
+**实际**：exitReason 的取值因退出方式而异，且部分终态不设置 exitReason：
+- `COMPLETED`: 不设置 exitReason（null）
+- `EXITED`: 取 EXIT 步骤的 `config.reason`，无配置时默认 `"exit_step"`
+- `CANCELLED`（用户手动）: `"Cancelled by user"` 或 `"Cancelled by user (bulk cancel)"`
+- `CANCELLED`（项目禁用）: `"Project disabled"`
+- `FAILED`: 不设置 exitReason，错误信息记录在 StepExecution.error 中
+**代码依据**：[WorkflowExecutionService.ts#L816](file:///d:/fz/0601-1/solo-dogfeeding/code/54-plunk/apps/api/src/services/WorkflowExecutionService.ts#L816)
+
+### ❗ 误判点 13：调度触发类型的可用性
+**误解**：SCHEDULE 触发类型已经实现，可以配置 cron 定时触发工作流。
+**实际**：`WorkflowTriggerType.SCHEDULE` 仅在枚举和 schema 注释中声明，**没有任何实际调度执行逻辑**——没有 cron 调度器、没有定时扫描任务、没有对应的队列 worker。
+**代码依据**：[schema.prisma#L681-L685](file:///d:/fz/0601-1/solo-dogfeeding/code/54-plunk/packages/db/prisma/schema.prisma#L681-L685)
+
+### ❗ 误判点 14：WEBHOOK 的 method 字段支持模板变量
+**误解**：WEBHOOK 配置的所有字段都支持 `{{变量}}` 模板渲染。
+**实际**：`url`、`headers` 的值、`body` 的字符串值都支持模板渲染，但 `method` 字段**不参与模板渲染**，始终作为字面 HTTP 动词使用（防止模板注入）。
+**代码依据**：[WorkflowExecutionService.ts#L940-L954](file:///d:/fz/0601-1/solo-dogfeeding/code/54-plunk/apps/api/src/services/WorkflowExecutionService.ts#L940-L954)
+
+### ❗ 误判点 15：UPDATE_CONTACT 步骤仅修改联系人数据
+**误解**：UPDATE_CONTACT 步骤只会更新联系人的属性和订阅状态，不会产生其他影响。
+**实际**：当 `subscriptionAction` 导致订阅状态实际改变时，会**隐式触发 `contact.subscribed` 或 `contact.unsubscribed` 事件**，可能唤醒其他工作流的 WAIT_FOR_EVENT 步骤，甚至启动新的工作流实例。
+**代码依据**：[WorkflowExecutionService.ts#L1069-L1076](file:///d:/fz/0601-1/solo-dogfeeding/code/54-plunk/apps/api/src/services/WorkflowExecutionService.ts#L1069-L1076)
+
+### ❗ 误判点 16：事件唤醒是原子操作
+**误解**：`handleEvent()` 唤醒等待步骤是原子的，并发情况下也不会重复执行。
+**实际**：`handleEvent()` 先查询 WAITING 列表再逐个更新推进，**没有数据库事务包裹**。同一事件并发到达时，两个请求可能同时读到同一个 WAITING 的 StepExecution，导致重复推进下游步骤。
+**代码依据**：[WorkflowExecutionService.ts#L401-L462](file:///d:/fz/0601-1/solo-dogfeeding/code/54-plunk/apps/api/src/services/WorkflowExecutionService.ts#L401-L462)
+
+### ❗ 误判点 17：DELAY 的 "days" 是自然日
+**误解**：配置 "1 day" 延迟就是到下一天的同一时间（考虑时区和夏令时）。
+**实际**：延迟使用 `Date.now() + delayMs` 计算，`1 day = 24 × 60 × 60 × 1000` 毫秒，**不涉及时区转换，不考虑夏令时**，就是精确的 24 小时时长。
+**代码依据**：[WorkflowExecutionService.ts#L606-L623](file:///d:/fz/0601-1/solo-dogfeeding/code/54-plunk/apps/api/src/services/WorkflowExecutionService.ts#L606-L623)
+
 ---
 
 ## 八、关键状态流转图
@@ -555,10 +713,10 @@ try {
                 ├─ WAIT_FOR_EVENT → WAITING ─┬─ 事件到达 ─┐
                 │                              └─ 超时 ────┘
                 │
-                ├─ 无下一步 → COMPLETED
-                ├─ EXIT 步骤 → EXITED
-                ├─ 异常 → FAILED
-                └─ 用户取消 / 项目禁用 → CANCELLED
+                ├─ 无下一步 → COMPLETED（exitReason 空）
+                ├─ EXIT 步骤 → EXITED（exitReason = config.reason || "exit_step"）
+                ├─ 异常 → FAILED（exitReason 空，错误在 step.error）
+                └─ 用户取消 / 项目禁用 → CANCELLED（exitReason 有明确值）
 ```
 
 ### 8.2 StepExecution 状态流转
@@ -601,7 +759,16 @@ PENDING → RUNNING ─┬─ 成功 → COMPLETED
 - BullMQ 指数退避重试（3 次）
 - 项目禁用自动取消
 - 失败状态持久化 + 通知
-- Webhook SSRF 多层防护
+- Webhook SSRF 多层防护（IPv4+IPv6 + 运营商共享段）
+
+### 已知风险与限制
+| 风险点 | 说明 |
+|--------|------|
+| 同步递归长链 | 多步骤同步执行可能超时，遇 DELAY/WAIT_FOR_EVENT 才中断 |
+| 事件唤醒非原子 | handleEvent 无事务，并发可能重复推进 |
+| UPDATE_CONTACT 副作用 | 改订阅会触发事件，可能级联启动其他 workflow |
+| SCHEDULE 未实现 | 仅声明枚举，无实际调度逻辑 |
+| DELAY 无时区 | 按毫秒精确计算，不考虑夏令时和自然日 |
 
 ### 易误判点速查
 | 行为 | 实际表现 |
@@ -614,3 +781,10 @@ PENDING → RUNNING ─┬─ 成功 → COMPLETED
 | 删除 Step | 级联删除所有下游 Steps |
 | 活跃时修改 | 仅允许改名称和位置 |
 | FAILED 后 | 不会自动重试，状态为终态 |
+| SCHEDULE 触发 | 仅声明未实现 |
+| WEBHOOK method | 不参与模板渲染 |
+| UPDATE_CONTACT | 改订阅会触发额外事件 |
+| 事件唤醒 | 非原子，并发有重复推进风险 |
+| DELAY days | 精确 24 小时，无时区/夏令时 |
+| TRIGGER/EXIT 入出边 | 无强制校验，EXIT 出边不执行 |
+| exitReason | 不同终态来源不同，部分终态为空 |
