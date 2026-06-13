@@ -52,8 +52,8 @@ EventService / MeterService / CampaignService (后置处理)
 
 | 项目 | 同步链路 [EmailService.ts#L405-L419](file:///d:/fz/0601-1/solo-dogfeeding/code/51-plunk/apps/api/src/services/EmailService.ts#L405-L419) | Worker 链路 [email-processor.ts#L215-L229](file:///d:/fz/0601-1/solo-dogfeeding/code/51-plunk/apps/api/src/jobs/email-processor.ts#L215-L229) |
 |------|-------------------------------------------------------------------------------------------------------------------------------------|---------------------------------------------------------------------------------------------------------------------------------------------|
-| `to` 参数 | 只传 `[recipientEmail]` 字符串数组 | 传 `[{name: contact.fullName || email, email: email}]` 对象数组（携带收件人姓名，邮件客户端会显示 "张三 <zhang@example.com>"） |
-| `replyTo` | `email.replyTo \|\| undefined` | 额外回退 `email.project.replyTo`（项目级默认发信地址） |
+| `to` 参数 | 只传 `[recipientEmail]` 字符串数组（[EmailService.ts#L381-L411](file:///d:/fz/0601-1/solo-dogfeeding/code/51-plunk/apps/api/src/services/EmailService.ts#L381-L411)） | 从 `email.toName` 字段取收件人姓名，优先传 `[{name: email.toName, email: recipientEmail}]` 对象数组（携带收件人姓名，邮件客户端显示 "张三 <zhang@example.com>"）；无 `toName` 时降级为字符串数组（[email-processor.ts#L177-L179](file:///d:/fz/0601-1/solo-dogfeeding/code/51-plunk/apps/api/src/jobs/email-processor.ts#L177-L179)、[L220](file:///d:/fz/0601-1/solo-dogfeeding/code/51-plunk/apps/api/src/jobs/email-processor.ts#L220)） |
+| `replyTo` | `email.replyTo \|\| undefined`（[EmailService.ts#L415](file:///d:/fz/0601-1/solo-dogfeeding/code/51-plunk/apps/api/src/services/EmailService.ts#L415)） | 与同步链路一致，`email.replyTo \|\| undefined`（[email-processor.ts#L225](file:///d:/fz/0601-1/solo-dogfeeding/code/51-plunk/apps/api/src/jobs/email-processor.ts#L225)），无 `project.replyTo` 回退 |
 | 附件计费逻辑 | 不区分 | 有附件时 Meter 计费 **×2**（[email-processor.ts#L245-L248](file:///d:/fz/0601-1/solo-dogfeeding/code/51-plunk/apps/api/src/jobs/email-processor.ts#L245-L248)） |
 
 **结论**：Worker 链路对 Provider 参数做了更完善的处理，是"生产级"实现；同步链路相对简陋，可能是早期实现被保留用于测试。
