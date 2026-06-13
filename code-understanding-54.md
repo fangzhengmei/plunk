@@ -329,6 +329,55 @@ const variables = {
 }
 ```
 
+**模板渲染的三大坑**（SEND_EMAIL 和 WEBHOOK 共用）：
+模板渲染函数 [renderTemplate()](file:///d:/fz/0601-1\solo-dogfeeding\code\54-plunk\packages\shared\src\template.ts#L11-L38) 存在三处容易踩坑的设计：
+
+**坑 1：`||` 对零和空串等假值短路**
+变量查找使用 `||` 运算符串联三层查找，**所有 JavaScript 假值（`0`、`""`、`false`）都会被短路**，不会被当作有效值使用：
+
+```typescript
+const value =
+  getValue(variables, mainKey) ||      // 第 1 层：嵌套路径查找
+  variables[mainKey] ||                // 第 2 层：顶层键查找
+  (variables.data as Record<string, unknown>)?.[mainKey];  // 第 3 层：data 回落
+```
+
+| 变量实际值 | 是否被当作有效值 | 说明 |
+|---------|----------------|------|
+| `"hello"` | ✅ 是 | 非空字符串 |
+| `0` | ❌ 否 | 数值 0 被 `||` 跳过 |
+| `""` | ❌ 否 | 空串被跳过 |
+| `false` | ❌ 否 | 布尔 false 被跳过 |
+| `null`/`undefined` | ❌ 否 | 空值被跳过 |
+
+> 注意：最后返回用 `??`，只有 null/undefined 才会回退到 defaultValue
+
+**坑 2：数组字段被自动包成 `<li>` 列表**
+如果变量值是数组类型，会被自动 map 成 HTML `<li>` 列表，**无法作为普通字符串使用：
+
+```typescript
+if (Array.isArray(value)) {
+  return value.map((e: string) => `<li>${e}</li>`).join('\n');
+}
+```
+
+- 例如 `tags: ["a", "b", "c"]` 会被渲染成：
+```html
+<li>a</li>
+<li>b</li>
+<li>c</li>
+```
+
+**坑 3：缺命中时自动回落到 `data` 命名空间**
+前两层查找都失败时，**自动尝试从 `variables.data[mainKey]` 再找一遍。这意味着 `variables = { id, email, ...contactData, ...executionContext, data: contactData }` 的结构下，即便顶层键不存在，还会在 `data.键` 再找一次。
+
+三层查找顺序：
+1. `getValue(variables, "firstName")` → 嵌套路径（如 `data.firstName`）
+2. `variables["firstName"]` → 顶层键（因 `...contactData` 展开，通常能命中）
+3. `variables.data["firstName"]` → 回落到 data 命名空间
+
+代码依据：[template.ts#L26-L37](file:///d:/fz/0601-1/solo-dogfeeding/code/54-plunk/packages/shared/src/template.ts#L26-L37)
+
 ---
 
 ## 三、触发条件与启动机制
@@ -931,4 +980,18 @@ PENDING → RUNNING ─┬─ 成功 → COMPLETED
 | notEquals null | 返回 false，不匹配空值 |
 | 删除 Step | 级联删除所有下游 Steps |
 | 活跃时修改 | 仅允许改名称和位置 |
-| FAILED 后
+| FAILED 后 | 不会自动重试，状态为终态 |
+| SCHEDULE 触发 | 仅声明未实现，无调度器/扫描器/worker |
+| WEBHOOK method | 不参与模板渲染，始终为字面量动词 |
+| WEBHOOK 未配 body | 自动发送标准化默认载荷（contact+workflow+execution+event） |
+| WEBHOOK GET 请求 | 即使配置了 body 也不发送请求体 |
+| UPDATE_CONTACT | 改订阅会触发额外事件，可能级联启动其他 workflow |
+| 事件唤醒 | 非原子操作，并发有重复推进风险（超时侧有防御，事件侧无） |
+| DELAY days | 精确 24 小时毫秒数，无时区/夏令时/自然日概念 |
+| CONDITION 未知操作符 | 直接 throw Error，步骤和执行均标记 FAILED |
+| CONDITION multi default | 隐式兜底，无需在 Schema 中显式声明 default |
+| SEND_EMAIL/WEBHOOK 变量 | 浅展开覆盖，contact.data/context 可能覆盖 id/email 等系统键 |
+| execution.context | 启动时一次性写入，后续永不修改；新唤醒事件数据存 StepExecution.output |
+| WAIT_FOR_EVENT 唤醒防御 | 不对称：超时侧双重防御，事件侧无原子性保障 |
+| TRIGGER/EXIT 入出边 | 无强制校验，EXIT 出边不执行 |
+| exitReason 取值 | 不同终态来源不同，COMPLETED/FAILED 为空 |
