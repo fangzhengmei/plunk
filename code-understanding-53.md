@@ -2,13 +2,13 @@
 
 ## 概述
 
-本文档从代码结构切入，梳理联系人导入（CSV Import）与分段（Segments）的完整协作流程，将整个链路拆分为四个核心协作环节：**导入文件处理**、**联系人去重**、**字段映射**、**Segment 更新**。
+本文档从代码结构切入，梳理联系人导入（CSV Import）与分段（Segments）的完整协作流程。全文分为五个环节和三大隐性协作关系的深度分析。
 
 ---
 
-## 一、导入文件处理环节
+## 一、导入文件处理
 
-### 1.1 入口：HTTP 上传
+### 1.1 HTTP 上传入口
 
 - **Controller**: [Contacts.ts](file:///d:/fz/0601-1/solo-dogfeeding/code/53-plunk/apps/api/src/controllers/Contacts.ts) `importCsv` 方法（第 306-334 行）
 - **路由**: `POST /contacts/import`
@@ -51,7 +51,7 @@
 
 ---
 
-## 二、联系人去重环节
+## 二、联系人去重
 
 ### 2.1 去重策略：按 email + projectId 唯一约束
 
@@ -93,7 +93,7 @@ findFirst({ projectId, email })
 
 ---
 
-## 三、字段映射环节
+## 三、字段映射
 
 ### 3.1 CSV 表头映射
 
@@ -169,13 +169,49 @@ SegmentFilter {
 }
 ```
 
-### 4.3 Segment 计数更新（定时轮询）
+### 4.3 条件编译（buildWhereClause）
+
+位置: [SegmentService.ts](file:///d:/fz/0601-1/solo-dogfeeding/code/53-plunk/apps/api/src/services/SegmentService.ts) 第 885-893 行（入口），递归展开
+
+支持的字段类型：
+- **标准字段**: `email`, `subscribed`, `createdAt`, `updatedAt`
+- **JSON 字段**: `data.xxx`（通过 PostgreSQL jsonb 路径查询）
+- **事件字段**: `event.xxx`（通过 events 关联表 + some/none 查询）
+- **邮件活动**: `email.opened`, `email.clicked` 等（通过 emails 关联表）
+- **Segment 嵌套**: `segment.<segmentId>`（递归解析引用的 segment）
+
+### 4.4 静态 Segment 手动管理
+
+- **添加成员**: `POST /segments/:id/members` → `SegmentService.addContacts()`
+  - 支持 `createMissing` 选项：不存在的邮箱自动创建联系人
+  - 已有 membership 记录但已退出的 → 重新激活（exitedAt = null）
+- **移除成员**: `DELETE /segments/:id/members` → `SegmentService.removeContacts()`
+  - 软删除：设置 exitedAt = 当前时间
+
+---
+
+## 五、Segment 刷新入口全景：四个入口，三个真正落地
+
+Segment 重算有**四个入口**，其中一个有实现没调用，真正落到生产的是三个。每个入口负责不同的场景。
+
+| 入口 | 触发方式 | 调用路径 | 影响范围 | 落到生产？ |
+|-----|---------|---------|---------|-----------|
+| 定时轮询 | 每 5 分钟自动 | `app.ts L473` 直接 `segmentCountQueue.add()` | 全平台所有项目所有 segment | ✅ |
+| 手动 refresh | `POST /segments/:id/refresh` | `Segments.refresh` → `SegmentService.refreshMemberCount()` | 单个 segment | ✅ |
+| 手动 compute | `POST /segments/:id/compute` | `Segments.compute` → `SegmentService.computeMembership()` | 单个 segment | ✅ |
+| queueSegmentCountUpdate | 预留 API | `QueueService.queueSegmentCountUpdate()` → `segmentCountQueue.add()` | 全项目或单个项目 | ❌ 业务零调用 |
+
+### 5.1 入口一：定时轮询（生产主链路）
+
+**定位：后台兜底刷新，保证所有数据最终一致。**
 
 #### 触发方式
 
-- **定时任务**: [app.ts](file:///d:/fz/0601-1/solo-dogfeeding/code/53-plunk/apps/api/src/app.ts) 第 473-482 行
-- **频率**: 每 5 分钟一次（BullMQ repeatable job）
-- **Job ID**: `segment-count-repeatable`（固定 ID 防重复）
+- 位置: [app.ts](file:///d:/fz/0601-1/solo-dogfeeding/code/53-plunk/apps/api/src/app.ts) 第 473-482 行
+- 频率: 每 5 分钟一次（BullMQ repeatable job）
+- **调用方式**: 直接 `segmentCountQueue.add()`，**没有走 `QueueService.queueSegmentCountUpdate()` 封装**
+- Job data: `{}`（空对象，无 projectId）
+- Job ID: `segment-count-repeatable`（固定 ID 防重复）
 
 #### 处理链路
 
@@ -184,31 +220,81 @@ segmentCountQueue (队列)
     │
     ▼
 segment-count-processor.ts → processSegmentCountUpdate()
+    │  job.data = {}  （空，无 projectId）
     │
-    ├─ 有 projectId → 处理单个项目
-    │
-    └─ 无 projectId → 遍历所有活跃项目（每批 10 个，批间延迟 2s）
+    └─ 遍历所有活跃项目（每批 10 个，批间延迟 2s）
          │
          ▼
-    processProjectSegments()
+    processProjectSegments(projectId)
          │
-         ├─ trackedSegments → SegmentService.computeMembership() 全量重算 + 事件
+         ├─ trackMembership=true  → SegmentService.computeMembership()  重链路
+         │    （全量重算 + 写 membership + entry/exit 事件）
          │
-         └─ nonTrackedSegments → SegmentService.refreshAllMemberCounts() 仅更新计数
+         └─ trackMembership=false → SegmentService.refreshAllMemberCounts()  轻链路
+              （仅 COUNT() + 更新 memberCount）
 ```
 
 位置: [segment-count-processor.ts](file:///d:/fz/0601-1/solo-dogfeeding/code/53-plunk/apps/api/src/jobs/segment-count-processor.ts)
 
 #### Worker 限制
 
-- 并发数: 1
+- 并发数: 1（串行处理避免 DB 过载）
 - 限流器: 每分钟最多 1 个 job
 
-### 4.4 成员关系计算（computeMembership）
+#### 覆盖场景
 
-位置: [SegmentService.ts](file:///d:/fz/0601-1/solo-dogfeeding/code/53-plunk/apps/api/src/services/SegmentService.ts) 第 449-631 行
+1. 导入新联系人后的最终一致（导入链路不主动刷新，靠定时兜底）
+2. 联系人属性变化后的成员变更
+3. segment 条件被修改后未手动 compute 时的增量追赶
+4. 事件触发导致的成员进出（如「近 7 天未登录」条件随时间变化）
 
-流程：
+---
+
+### 5.2 入口二：POST /segments/:id/refresh（手动轻量刷新）
+
+**定位：用户主动触发，只想立刻看最新人数。**
+
+#### 调用链路
+
+- 路由: [Segments.ts](file:///d:/fz/0601-1/solo-dogfeeding/code/53-plunk/apps/api/src/controllers/Segments.ts) 第 219-236 行
+- 服务层: `SegmentService.refreshMemberCount(projectId, segmentId)`
+- 位置: [SegmentService.ts](file:///d:/fz/0601-1/solo-dogfeeding/code/53-plunk/apps/api/src/services/SegmentService.ts) 第 265-284 行
+
+#### 行为
+
+```
+1. 读 segment 记录（type + condition）
+2. STATIC → COUNT SegmentMembership 表
+   DYNAMIC → buildWhereClause + COUNT contact 表
+3. UPDATE segment SET memberCount = 结果
+4. 返回 memberCount 数字
+```
+
+#### 关键特性
+
+- **单 segment**：只刷新指定 ID 的 segment
+- **轻量**：只做 COUNT 查询 + UPDATE，不扫描全表，不写 membership，不触发事件
+- **不区分 trackMembership**：对所有 segment 只做计数，哪怕开了 trackMembership 也不重算成员关系
+
+#### 覆盖场景
+
+- 刚导入完一批联系人，用户等不及 5 分钟定时，主动点「刷新」按钮看人数
+- segment 列表页 memberCount 显示的是缓存值，用户想确认当前真实人数
+
+---
+
+### 5.3 入口三：POST /segments/:id/compute（手动全量重算）
+
+**定位：用户主动触发，要立刻重算所有成员并触发事件。**
+
+#### 调用链路
+
+- 路由: [Segments.ts](file:///d:/fz/0601-1/solo-dogfeeding/code/53-plunk/apps/api/src/controllers/Segments.ts) 第 199-216 行
+- 服务层: `SegmentService.computeMembership(projectId, segmentId)`
+- 位置: [SegmentService.ts](file:///d:/fz/0601-1/solo-dogfeeding/code/53-plunk/apps/api/src/services/SegmentService.ts) 第 449-631 行
+
+#### 完整流程（与定时任务中的重链路完全相同）
+
 1. 用游标分页（1000 条/批）获取所有符合条件的 contactId，存入 Set
 2. 用游标分页获取当前活跃成员的 contactId，存入 Set
 3. 计算差集：`toAdd`（新加入）、`toRemove`（需退出）
@@ -218,37 +304,106 @@ segment-count-processor.ts → processSegmentCountUpdate()
 
 > 注意: STATIC 类型的 segment 不做联系人扫描，直接从 membership 表计数。
 
-### 4.5 条件编译（buildWhereClause）
+#### 关键特性
 
-位置: SegmentService.ts 第 885-893 行（入口），递归展开
+- **单 segment**：只重算指定 ID 的 segment
+- **全量重算**：不管有没有变化，都重新扫描所有联系人
+- **写 membership**：新增/更新 SegmentMembership 记录
+- **触发生成事件**：entry/exit 事件会驱动 Workflow 引擎
+- **同步等待**：API 同步调用，大 segment 可能需要几秒甚至几十秒才返回
 
-支持的字段类型：
-- **标准字段**: `email`, `subscribed`, `createdAt`, `updatedAt`
-- **JSON 字段**: `data.xxx`（通过 PostgreSQL jsonb 路径查询）
-- **事件字段**: `event.xxx`（通过 events 关联表 + some/none 查询）
-- **邮件活动**: `email.opened`, `email.clicked` 等（通过 emails 关联表）
-- **Segment 嵌套**: `segment.<segmentId>`（递归解析引用的 segment）
+#### 覆盖场景
 
-### 4.6 静态 Segment 手动管理
-
-- **添加成员**: `POST /segments/:id/members` → `SegmentService.addContacts()`
-  - 支持 `createMissing` 选项：不存在的邮箱自动创建联系人
-  - 已有 membership 记录但已退出的 → 重新激活（exitedAt = null）
-- **移除成员**: `DELETE /segments/:id/members` → `SegmentService.removeContacts()`
-  - 软删除：设置 exitedAt = 当前时间
-
-### 4.7 手动触发更新
-
-- `POST /segments/:id/refresh` → 刷新 memberCount
-- `POST /segments/:id/compute` → 全量重算 membership（仅 trackMembership 的 segment）
+- 刚改完 segment 的筛选条件，想立刻让新条件生效并触发相关 workflow
+- 修复了 segment 条件 bug 后，想立刻重算历史成员
+- 紧急营销活动前，确认 segment 成员是最新的并触发必要的自动化流程
 
 ---
 
-## 五、关键协作关系深度分析
+### 5.4 入口四：queueSegmentCountUpdate（预留 API，零调用）
 
-### 5.1 导入完成后 Segment 什么时候刷新？
+**定位：有完整实现，但业务代码零调用，属于预留的触发接口。**
 
-**结论：导入完成后不会立即刷新 Segment，完全依赖定时轮询（最坏延迟约 5 分钟）。**
+#### 代码位置
+
+定义: [QueueService.ts](file:///d:/fz/0601-1/solo-dogfeeding/code/53-plunk/apps/api/src/services/QueueService.ts) 第 425-433 行
+
+```typescript
+public static async queueSegmentCountUpdate(projectId?: string): Promise<Job<SegmentCountJobData>> {
+  return segmentCountQueue.add(
+    'update-segment-counts',
+    { projectId },   // ← 支持传 projectId 只处理单个项目
+    {
+      jobId: projectId ? `segment-count-${projectId}-${Date.now()}` : `segment-count-all-${Date.now()}`,
+    },
+  );
+}
+```
+
+#### 核实结果：全代码库零业务调用
+
+通过全代码库 grep `queueSegmentCountUpdate` 确认：
+- **唯一出现位置**：[QueueService.ts](file:///d:/fz/0601-1/solo-dogfeeding/code/53-plunk/apps/api/src/services/QueueService.ts#L425) 的定义本身
+- **定时任务**没有走这个封装——[app.ts L473](file:///d:/fz/0601-1/solo-dogfeeding/code/53-plunk/apps/api/src/app.ts#L473) 直接 `segmentCountQueue.add()`
+- **导入完成后**（import-processor）没有调用
+- **ContactService.upsert()** 没有调用
+- **测试文件**中也没有引用
+
+#### 推测设计意图
+
+这个方法原本可能计划作为「按需触发」的标准入口，例如导入完成后调用 `queueSegmentCountUpdate(projectId)` 只刷新该项目的 segment。但最终没有接入，推测原因：
+1. 导入后立即重算对 DB 压力太大（10 万条导入后立刻全表扫描）
+2. 5 分钟窗口的不一致对大多数场景可接受
+3. 用户真的急可以手动点 refresh/compute 按钮
+4. 即使需要按项目触发，app.ts 里已经直接操作 `segmentCountQueue`，绕过了这个封装
+
+**这个方法目前是一个死代码入口。**
+
+---
+
+### 5.5 三大生产入口的场景分工图
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                     什么场景该走哪个入口？                                │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                         │
+│  「我不想管，数据最终一致就行」                                          │
+│      └─→ 定时轮询 (每5分钟)  ← 默认行为，无需操作                       │
+│                                                                         │
+│  「导入完了，人数看着不对」                                              │
+│      └─→ POST /segments/:id/refresh  ← 只 COUNT，秒级返回              │
+│                                                                         │
+│  「改了条件，要让 Workflow 立刻生效」                                    │
+│      └─→ POST /segments/:id/compute  ← 全量重算+事件，可能耗时较长      │
+│                                                                         │
+│  「我想在代码里按项目触发重算」                                          │
+│      └─→ ❌ queueSegmentCountUpdate  ← 死代码，未接入                   │
+│          临时方案：直接 segmentCountQueue.add() 或手动 compute            │
+│                                                                         │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+#### 补充：隐式即时更新场景
+
+除了以上三个显式入口，segment 在以下场景会即时更新 memberCount（不需要等 5 分钟定时）：
+
+| 场景 | 代码位置 | 行为 |
+|-----|---------|------|
+| 创建 segment 时 | [SegmentService.create](file:///d:/fz/0601-1/solo-dogfeeding/code/53-plunk/apps/api/src/services/SegmentService.ts#L118-L166) 第 140 行 | 同步 `COUNT()` 计算初始 memberCount |
+| 修改 DYNAMIC segment 条件时 | [SegmentService.update](file:///d:/fz/0601-1/solo-dogfeeding/code/53-plunk/apps/api/src/services/SegmentService.ts#L171-L213) 第 202 行 | 同步 `COUNT()` 更新 memberCount |
+| STATIC segment 添加成员后 | [SegmentService.addContacts](file:///d:/fz/0601-1/solo-dogfeeding/code/53-plunk/apps/api/src/services/SegmentService.ts#L331-L404) 第 399 行 | `COUNT(membership)` 更新 memberCount |
+| STATIC segment 移除成员后 | [SegmentService.removeContacts](file:///d:/fz/0601-1/solo-dogfeeding/code/53-plunk/apps/api/src/services/SegmentService.ts#L409-L443) 第 438 行 | `COUNT(membership)` 更新 memberCount |
+
+> 注意：创建/修改 segment 时只做 `COUNT()` 更新 memberCount，**不做** `computeMembership()` 全量重算。也就是说新 segment 即使开了 trackMembership，也需要等到下次定时轮询或手动 compute 时才会生成 membership 记录和 entry/exit 事件。
+
+---
+
+## 六、三大隐性协作关系深度分析
+
+### 6.1 协作关系 A：导入 → Segment 的时序断层
+
+**核心结论：导入完成后不会立即刷新 Segment，完全依赖定时轮询（最坏延迟约 5 分钟）。**
 
 #### 代码证据
 
@@ -262,36 +417,33 @@ segment-count-processor.ts → processSegmentCountUpdate()
    - upsert 方法只做：写入 contact 表 + 订阅状态变化事件追踪
    - **无任何 Segment 相关调用**
 
-3. **queueSegmentCountUpdate 方法存在但业务代码未主动调用**
-   - 定义位置: [QueueService.ts](file:///d:/fz/0601-1/solo-dogfeeding/code/53-plunk/apps/api/src/services/QueueService.ts) 第 425-433 行
-   - 通过全代码库 grep，该方法**仅在测试文件中被引用**，业务代码无调用点
+3. **queueSegmentCountUpdate 是死代码**（见 5.4 节）
 
 #### 实际刷新时序
 
 ```
 T=0min  用户上传 CSV → importQueue → 导入 worker 开始处理
 T=1min  导入完成 → 仅通知用户，Segment memberCount 仍是旧值
-T=5min  定时 repeatable job 触发（每5分钟）→ segmentCountQueue 入队
+        ├─ 用户不急 → 等到 T=5min 定时轮询自动刷新
+        └─ 用户很急 → 点「刷新」按钮 → POST /segments/:id/refresh → 立刻 COUNT
+                      或 点「重算」按钮 → POST /segments/:id/compute → 全量重算 + 事件
+T=5min  定时 repeatable job 触发 → segmentCountQueue 入队
 T=5min+ segment-count-processor 执行
         → STATIC/DYNAMIC nonTracked: COUNT() 更新 memberCount
         → DYNAMIC tracked: 全量 computeMembership()
 T=5min+ Segment 数据与导入结果一致（视项目大小和 segment 数量有延迟）
 ```
 
-#### 为什么这样设计？权衡分析
+#### 设计权衡
 
 | 方案 | 优点 | 缺点 |
 |-----|-----|-----|
-| **当前方案：定时轮询** | 1. 导入性能不受影响（一次大导入不会被 segment 重算拖慢）<br>2. 多次导入在 5 分钟窗口内被合并为一次重算，减少重复计算<br>3. 代码解耦，导入链路和 segment 链路无依赖 | 最坏 5 分钟不一致窗口 |
-| 导入完成后立即刷新 | 实时性好 | 1. 大批量导入（如 10 万条）后立即 segment 重算会对 DB 造成突发压力<br>2. 连续多次导入会触发多次重复重算<br>3. 导入和 segment 强耦合 |
-
-> **补充说明**：除了定时轮询，segment 在以下场景会即时更新 memberCount：
-> - 创建/修改 segment 条件时（[SegmentService.create](file:///d:/fz/0601-1/solo-dogfeeding/code/53-plunk/apps/api/src/services/SegmentService.ts#L118-L166) 和 [update](file:///d:/fz/0601-1/solo-dogfeeding/code/53-plunk/apps/api/src/services/SegmentService.ts#L171-L213)）同步 COUNT
-> - STATIC segment 手动 addContacts/removeContacts 后（[SegmentService.ts](file:///d:/fz/0601-1/solo-dogfeeding/code/53-plunk/apps/api/src/services/SegmentService.ts#L331-L443)）立即更新计数
+| **当前方案：定时兜底 + 手动按需** | 1. 导入性能不受影响（大导入不会被 segment 重算拖慢）<br>2. 多次导入在 5 分钟窗口内被合并为一次重算<br>3. 代码解耦<br>4. 紧急场景可手动触发 | 不主动干预时最坏 5 分钟不一致 |
+| 导入后自动调用 queueSegmentCountUpdate | 实时性好 | 1. 大批量导入后立即 segment 重算对 DB 造成突发压力<br>2. 连续多次导入触发多次重复重算<br>3. 导入和 segment 强耦合 |
 
 ---
 
-### 5.2 trackMembership 为什么分成两条更新链路？
+### 6.2 协作关系 B：trackMembership 分叉链路
 
 **核心原因：成本差异巨大 + 不同场景下对「精确历史」和「事件触发」的需求不同。**
 
@@ -319,19 +471,22 @@ processProjectSegments(projectId)
 #### 为什么需要重链路？三个关键能力
 
 **1. Workflow 触发能力**
-Segment entry/exit 事件是 Workflow 系统的重要触发源。例如：
-- 「当联系人进入『VIP客户』segment 时，自动发欢迎邮件」→ 监听 `segment.vip-customers.entry` 事件
-- 「当联系人退出『活跃用户』segment 时，启动挽回流程」→ 监听 `segment.active-users.exit` 事件
 
-如果只更新 memberCount（一个数字），Workflow 引擎无法知道具体是哪个联系人进出了 segment，也就无法启动针对该联系人的流程。
+Segment entry/exit 事件是 Workflow 系统的重要触发源：
+- 「当联系人进入『VIP客户』segment 时，自动发欢迎邮件」→ 监听 `segment.vip-customers.entry`
+- 「当联系人退出『活跃用户』segment 时，启动挽回流程」→ 监听 `segment.active-users.exit`
+
+如果只更新 memberCount（一个数字），Workflow 引擎无法知道具体是哪个联系人进出了 segment。
 
 **2. 精确的成员关系历史审计**
-`SegmentMembership` 表记录了 `enteredAt` 和 `exitedAt`，支持以下场景：
+
+`SegmentMembership` 表记录了 `enteredAt` 和 `exitedAt`，支持：
 - 「这个用户什么时候成为 VIP 的？什么时候降级的？」
 - 「过去 30 天有多少人进出了某 segment？」（营销漏斗分析）
 - 静态 segment 的成员管理（加入时间、软删除重激活）
 
 **3. 嵌套 segment 引用的性能优化**
+
 当 segment A 的条件引用 segment B 时（`field: "segment.<B的id>", operator: "memberOfSegment"`），如果 B 开启了 trackMembership，查询可以直接走 `SegmentMembership` 表的索引（`WHERE exitedAt IS NULL`），而不需要递归展开 B 的条件再做一次全量扫描。
 
 位置: [SegmentService.ts](file:///d:/fz/0601-1/solo-dogfeeding/code/53-plunk/apps/api/src/services/SegmentService.ts#L636-L685) `buildFilterCondition` 中对 `segment.` 前缀的处理：
@@ -346,20 +501,20 @@ Segment entry/exit 事件是 Workflow 系统的重要触发源。例如：
 
 #### 为什么需要轻链路？覆盖 80% 的场景
 
-大多数用户使用 segment 只是为了「给 campaign 选人群」和「看列表里的人数」，这两个场景只需要：
+大多数用户使用 segment 只是为了「给 campaign 选人群」和「看列表里的人数」：
 - 发 campaign 时动态执行条件查询（不需要预先存 membership）
 - 列表页显示一个大致准确的 memberCount
 
-对于这些场景，开启 trackMembership 会造成不必要的 DB 负担，尤其是：
+对于这些场景，开启 trackMembership 会造成不必要的 DB 负担：
 - 项目有数十个 segment，但只有 2-3 个需要做 workflow 触发
 - 联系人数在 10 万+ 级别，全量扫描代价显著
 - 每 5 分钟一次的重链路对 DB 造成持续压力
 
-> **设计总结**：这是典型的「按需付费」（pay-for-what-you-use）架构。默认关闭 trackMembership，成本最低（大多数用户无感）；需要高级功能（事件触发、历史审计、嵌套优化）的用户主动开启，用额外的计算资源换取更强的能力。
+> **设计总结**：这是典型的「按需付费」架构。默认关闭 trackMembership，成本最低；需要高级功能（事件触发、历史审计、嵌套优化）的用户主动开启，用额外计算资源换取更强能力。
 
 ---
 
-### 5.3 导入进来的自定义字段怎么进入 Segment 条件判断？
+### 6.3 协作关系 C：自定义字段 → Segment 条件判断
 
 **完整链路：CSV 文本 → PostgreSQL jsonb → Prisma 路径查询 → Segment 结果集**
 
@@ -378,9 +533,9 @@ CSV 行: Email,Plan,SignupDate,FirstName
            │
            ▼  [import-processor.ts L127-L130]
         Object.entries(customData).map(([k,v]) => [k, coerceCustomValue(v)])
-           │  coerceCustomValue: "Pro"→"Pro"(str), "2025-01-15"→"2025-01-15"(str 不符合数字正则), "John"→"John"(str)
+           │  "Pro"→"Pro"(str), "2025-01-15"→"2025-01-15"(str), "John"→"John"(str)
            ▼
-        调用 ContactService.upsert(projectId, email, { plan:"Pro", signupdate:"2025-01-15", firstname:"John" })
+        ContactService.upsert(projectId, email, { plan:"Pro", signupdate:"2025-01-15", firstname:"John" })
            │
            ▼  [ContactService.ts L261-L327] upsert() → mergeContactData()
         合并到 contact.data (JSONB 列)
@@ -414,7 +569,7 @@ GET /contacts/fields
     { field: "subscribed", type: "boolean", coverage: 100 },
     { field: "data.firstname", type: "string", coverage: 87 },   ← 导入的字段
     { field: "data.plan", type: "string", coverage: 87 },        ← 导入的字段
-    { field: "data.signupdate", type: "date", coverage: 63 },    ← 导入的字段，识别为 date
+    { field: "data.signupdate", type: "date", coverage: 63 },    ← 导入的字段
   ]
      │
      ▼
@@ -486,7 +641,7 @@ FilterCondition (上面的 JSON)
 
 位置: [SegmentService.ts](file:///d:/fz/0601-1/solo-dogfeeding/code/53-plunk/apps/api/src/services/SegmentService.ts#L932-L1020) `buildJsonFieldCondition`
 
-所有 data.xxx 字段的条件最终都通过 Prisma 的 `data: { path: [...], operator: value }` 语法编译为 PostgreSQL jsonb 操作，利用了 schema.prisma 中定义的 GIN 索引（第 155 行）。这使得数十万联系人中按自定义字段条件筛选的查询也能保持毫秒级响应。
+所有 data.xxx 字段的条件最终都通过 Prisma 的 `data: { path: [...], operator: value }` 语法编译为 PostgreSQL jsonb 操作，利用 [schema.prisma L155](file:///d:/fz/0601-1/solo-dogfeeding/code/53-plunk/packages/db/prisma/schema.prisma#L155) 的 GIN 索引。
 
 支持的 data 字段操作符：`equals` / `notEquals` / `contains` / `notContains` / `greaterThan` / `lessThan` / `greaterThanOrEqual` / `lessThanOrEqual` / `exists` / `notExists` / `within`（X 时间内）/ `olderThan`（X 时间前）。
 
@@ -494,56 +649,76 @@ FilterCondition (上面的 JSON)
 
 ---
 
-## 六、协作环节总览图（更新版）
+## 七、协作环节总览图
 
 ```
-┌─────────────────────┐
-│  1. 导入文件处理     │
-│  ContactsController  │
-│  → QueueService      │
-│  → import-processor  │
-└─────────┬───────────┘
-          │ CSV 解析 + 逐行处理
-          ▼
-┌─────────────────────┐
-│  2. 联系人去重       │
-│  ContactService      │
-│  .upsert()           │
-│  .mergeContactData() │
-└─────────┬───────────┘
-          │ 写入/更新 contact 表
-          ▼
-┌─────────────────────┐
-│  3. 字段映射         │
-│  coerceCustomValue   │
-│  email/subscribed    │
-│  特殊处理 + data 合并 │
-└─────────┬───────────┘
-          │ 持久化到 JSON 列
-          │
-          │  ┌──────────────────────┐
-          │  │  4. Segment 更新      │
-          └─▶│  (异步/定时触发)      │
-             │  segment-count-       │
-             │  processor (每5分钟)  │
-             │  → computeMembership  │
-             │  → refreshMemberCount │
-             └──────────────────────┘
+┌──────────────────────────────────────────────────────────────────────┐
+│  1. 导入文件处理                                                     │
+│  ContactsController → QueueService.queueImport → import-processor     │
+└────────────────────────┬─────────────────────────────────────────────┘
+                         │ CSV 解析 / 邮箱校验 / 类型推断
+                         ▼
+┌──────────────────────────────────────────────────────────────────────┐
+│  2. 联系人去重                                                       │
+│  findByEmail 判重 → upsert() → mergeContactData(增量合并)            │
+└────────────────────────┬─────────────────────────────────────────────┘
+                         │ 写入 contact 表 (data JSONB 列 + GIN 索引)
+                         │
+                         │ ┌────────────────────────────────────────────┐
+                         │ │  协作关系 A: 导入→Segment 时序断层         │
+                         │ │  ⚠ 导入后不立即刷新，等定时轮询(5min)      │
+                         │ │  用户急 → 手动 refresh/compute             │
+                         │ │  queueSegmentCountUpdate 是死代码          │
+                         │ └────────────────────────────────────────────┘
+                         ▼
+┌──────────────────────────────────────────────────────────────────────┐
+│  3. 字段映射                                                         │
+│  email/subscribed 特殊处理                                           │
+│  其他列 → coerceCustomValue(布尔/数字/字符串推断) → contact.data.*   │
+└────────────────────────┬─────────────────────────────────────────────┘
+                         │
+                         │ ┌────────────────────────────────────────────┐
+                         │ │  协作关系 C: 自定义字段→条件判断           │
+                         │ │  ① 落地: data JSONB 列 + GIN 索引         │
+                         │ │  ② 发现: getAvailableFields → 前端可选列表│
+                         │ │  ③ 编译: buildJsonFieldCondition          │
+                         │ │    data.xxx → Prisma path 查询 → SQL GIN  │
+                         │ └────────────────────────────────────────────┘
+                         ▼
+┌──────────────────────────────────────────────────────────────────────┐
+│  4. Segment 更新（四大入口）                                         │
+│                                                                      │
+│  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐  ┌──────────┐ │
+│  │ 定时轮询     │  │ 手动refresh  │  │ 手动compute  │  │ 预留API  │ │
+│  │ (每5min)     │  │ (COUNT)      │  │ (全量重算)   │  │ (死代码) │ │
+│  │ 全平台       │  │ 单segment    │  │ 单segment    │  │          │ │
+│  │ ✅ 生产主链路│  │ ✅ 看人数    │  │ ✅ 触发事件  │  │ ❌ 零调用│ │
+│  └──────────────┘  └──────────────┘  └──────────────┘  └──────────┘ │
+│         │                                                            │
+│         │ ┌────────────────────────────────────────────────────────┐ │
+│         │ │  协作关系 B: trackMembership 分叉                      │ │
+│         │ │  ├─ true  → computeMembership() 重链路                │ │
+│         │ │  │    全扫描+差集+写membership+entry/exit事件          │ │
+│         │ │  └─ false → refreshAllMemberCounts() 轻链路           │ │
+│         │ │       仅 COUNT() + 更新 memberCount                    │ │
+│         │ └────────────────────────────────────────────────────────┘ │
+└──────────────────────────────────────────────────────────────────────┘
 ```
 
 ---
 
-## 六、关键文件索引
+## 八、关键文件索引
 
 | 模块 | 文件路径 | 核心职责 |
 |------|---------|---------|
 | 导入入口 | [controllers/Contacts.ts](file:///d:/fz/0601-1/solo-dogfeeding/code/53-plunk/apps/api/src/controllers/Contacts.ts) | HTTP 接口、文件上传、队列调度 |
 | 导入 Worker | [jobs/import-processor.ts](file:///d:/fz/0601-1/solo-dogfeeding/code/53-plunk/apps/api/src/jobs/import-processor.ts) | CSV 解析、批量处理、进度通知 |
 | 联系人服务 | [services/ContactService.ts](file:///d:/fz/0601-1/solo-dogfeeding/code/53-plunk/apps/api/src/services/ContactService.ts) | CRUD、upsert、数据合并、字段发现 |
-| 队列服务 | [services/QueueService.ts](file:///d:/fz/0601-1/solo-dogfeeding/code/53-plunk/apps/api/src/services/QueueService.ts) | 所有 BullMQ 队列管理 |
+| 队列服务 | [services/QueueService.ts](file:///d:/fz/0601-1/solo-dogfeeding/code/53-plunk/apps/api/src/services/QueueService.ts) | 所有 BullMQ 队列管理（含 queueSegmentCountUpdate 死代码） |
 | Segment 服务 | [services/SegmentService.ts](file:///d:/fz/0601-1/solo-dogfeeding/code/53-plunk/apps/api/src/services/SegmentService.ts) | Segment CRUD、条件编译、成员计算 |
 | Segment Worker | [jobs/segment-count-processor.ts](file:///d:/fz/0601-1/solo-dogfeeding/code/53-plunk/apps/api/src/jobs/segment-count-processor.ts) | 定时更新 segment 计数和成员关系 |
-| Segment 控制器 | [controllers/Segments.ts](file:///d:/fz/0601-1/solo-dogfeeding/code/53-plunk/apps/api/src/controllers/Segments.ts) | Segment HTTP 接口 |
+| Segment 控制器 | [controllers/Segments.ts](file:///d:/fz/0601-1/solo-dogfeeding/code/53-plunk/apps/api/src/controllers/Segments.ts) | Segment HTTP 接口（含 refresh/compute） |
+| 应用启动 | [app.ts](file:///d:/fz/0601-1/solo-dogfeeding/code/53-plunk/apps/api/src/app.ts) | 定时任务注册（segment-count repeatable job） |
 | 数据模型 | [packages/db/prisma/schema.prisma](file:///d:/fz/0601-1/solo-dogfeeding/code/53-plunk/packages/db/prisma/schema.prisma) | Contact / Segment / SegmentMembership 表结构 |
 | Worker 入口 | [jobs/worker.ts](file:///d:/fz/0601-1/solo-dogfeeding/code/53-plunk/apps/api/src/jobs/worker.ts) | 所有后台 Worker 统一启动 |
 | 导入类型 | [packages/types/src/jobs/import.ts](file:///d:/fz/0601-1/solo-dogfeeding/code/53-plunk/packages/types/src/jobs/import.ts) | ContactImportJobData 等类型定义 |
