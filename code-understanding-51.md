@@ -29,6 +29,147 @@ EventService / MeterService / CampaignService (后置处理)
 
 ---
 
+## 补充章节：同步直发链路 vs 队列处理器链路 分工对比
+
+### 链路定位与代码位置
+
+系统中存在两条并行的邮件发送执行链路，它们共享模板编译和 SES Provider 发送，但责任边界有显著差异：
+
+| 维度 | 同步直发链路 | 队列处理器链路（主路径） |
+|------|-------------|------------------------|
+| **入口方法** | [EmailService.sendEmail(emailId)](file:///d:/fz/0601-1/solo-dogfeeding/code/51-plunk/apps/api/src/services/EmailService.ts#L290-L456) | [email-processor Worker handler](file:///d:/fz/0601-1/solo-dogfeeding/code/51-plunk/apps/api/src/jobs/email-processor.ts#L82-L279) |
+| **执行上下文** | 调用线程同步执行，阻塞请求 | BullMQ Worker 异步消费，不阻塞业务入口 |
+| **生产调用方** | 生产代码中**无直接调用**（仅被单元测试调用，见 `EmailService.test.ts`） | 三条入口：`sendTransactionalEmail` / `sendCampaignEmail` / `sendWorkflowEmail` 均通过 `QueueService.queueEmail` 入队后由 Worker 消费 |
+| **注释定位** | 注释 "Actually send the email via AWS SES / This is called by the email processor worker" | 注释为 BullMQ Worker 的处理函数 |
+
+> **关键事实**：`EmailService.sendEmail` 在当前生产代码中是"遗留/测试辅助"路径，线上实际发送走的是 email-processor Worker。两条链路逻辑高度相似但不完全一致，这是理解分工的基础。
+
+---
+
+### 1. Provider 发送（两条链路均负责，但参数构造有差异）
+
+两条链路最终都调用 [sendRawEmail](file:///d:/fz/0601-1/solo-dogfeeding/code/51-plunk/apps/api/src/services/SESService.ts#L87-L231)（AWS SES Provider），区别只在 `to` 字段的格式：
+
+| 项目 | 同步链路 [EmailService.ts#L405-L419](file:///d:/fz/0601-1/solo-dogfeeding/code/51-plunk/apps/api/src/services/EmailService.ts#L405-L419) | Worker 链路 [email-processor.ts#L215-L229](file:///d:/fz/0601-1/solo-dogfeeding/code/51-plunk/apps/api/src/jobs/email-processor.ts#L215-L229) |
+|------|-------------------------------------------------------------------------------------------------------------------------------------|---------------------------------------------------------------------------------------------------------------------------------------------|
+| `to` 参数 | 只传 `[recipientEmail]` 字符串数组 | 传 `[{name: contact.fullName || email, email: email}]` 对象数组（携带收件人姓名，邮件客户端会显示 "张三 <zhang@example.com>"） |
+| `replyTo` | `email.replyTo \|\| undefined` | 额外回退 `email.project.replyTo`（项目级默认发信地址） |
+| 附件计费逻辑 | 不区分 | 有附件时 Meter 计费 **×2**（[email-processor.ts#L245-L248](file:///d:/fz/0601-1/solo-dogfeeding/code/51-plunk/apps/api/src/jobs/email-processor.ts#L245-L248)） |
+
+**结论**：Worker 链路对 Provider 参数做了更完善的处理，是"生产级"实现；同步链路相对简陋，可能是早期实现被保留用于测试。
+
+---
+
+### 2. 域名校验（仅同步链路负责，Worker 链路缺失）
+
+这是两条链路**最关键的职责差异**：
+
+| 项目 | 同步链路 [EmailService.ts#L329-L331](file:///d:/fz/0601-1/solo-dogfeeding/code/51-plunk/apps/api/src/services/EmailService.ts#L329-L331) | Worker 链路 email-processor.ts |
+|------|----------------------------------------------------------------------------------------------------------------------------------------|-------------------------------|
+| `DomainService.verifyEmailDomain` | ✅ **有**。发送前显式调用，校验三项：<br>① 域名在 DB 存在<br>② 域名属于当前 project<br>③ `verified === true`<br>不满足抛 403 异常 | ❌ **无**。整个 Worker handler 中没有调用 `verifyEmailDomain` 或任何 DomainService 方法 |
+| 拦截效果 | 未验证域名的邮件 **SENDING 状态之前**就会失败，不会调用 SES | 未验证域名的邮件会被 **直接送入 SES**，由 AWS 侧抛出错误（通常是 `Email address is not verified`），catch 块再标记 FAILED |
+
+**风险分析**：Worker 链路缺少域名校验存在以下隐患：
+1. **无效 SES 调用消耗配额**：未验证域名的邮件会实际打到 SES API 才失败，占用每秒发送速率配额
+2. **错误信息不一致**：同步链路抛明确的中文业务错误，Worker 链路收到的是 AWS 原始英文错误
+3. **安全漏洞**：若入队后项目被回收了域名所有权（域名被另一个 project 占用），Worker 链路仍会以该域名发信
+
+---
+
+### 3. 订阅拦截（两条链路均负责，但时机和力度不同）
+
+订阅状态检查在链路中存在**双重校验**，但层级不同：
+
+| 层级 | 位置 | 检查内容 | 失败动作 |
+|------|------|---------|---------|
+| **第一层：入队前**（共享） | `sendTransactionalEmail` [L55-L75](file:///d:/fz/0601-1/solo-dogfeeding/code/51-plunk/apps/api/src/services/EmailService.ts#L55-L75)<br>`sendWorkflowEmail` [L203-L235](file:///d:/fz/0601-1/solo-dogfeeding/code/51-plunk/apps/api/src/services/EmailService.ts#L203-L235) | MARKETING 模板 + 已退订联系人 | **不入队**，直接返回或创建 FAILED Email |
+| **第二层：同步链路发送前** | [EmailService.sendEmail#L309-L326](file:///d:/fz/0601-1/solo-dogfeeding/code/51-plunk/apps/api/src/services/EmailService.ts#L309-L326) | `!email.contact.subscribed` 且非 TRANSACTIONAL | 跳过 SES 调用，直接 `status=FAILED` + `error='Contact is unsubscribed...'`，**不 throw**（return 静默结束） |
+| **第二层：Worker 链路发送前** | email-processor.ts | ❌ **无对应检查** | — |
+
+**设计意图解读**：
+- 同步链路的二次校验是"防御性"的：防止 PENDING Email 记录在入队后、实际发送前，联系人刚好退订导致违规（GDPR/反垃圾邮件合规）
+- Worker 链路**缺失这道防线**：若入队到消费之间存在时间差（高并发队列积压几秒到几分钟），期间退订的联系人仍会收到邮件
+- 注意：`sendCampaignEmail` 本身**不做入队前订阅检查**（由上游 Campaign 批处理 chain 统一在 `recipientIds` 构造时过滤），Worker 链路消费 Campaign 邮件时同样缺少二次校验
+
+---
+
+### 4. 状态更新（两条链路均负责，Worker 链路覆盖更全）
+
+状态更新职责对比：
+
+| 状态变化 | 同步链路 EmailService.sendEmail | Worker 链路 email-processor.ts |
+|---------|-------------------------------|-------------------------------|
+| **PENDING (初始)** | 不负责（由 `sendXxxEmail` 入口创建） | 不负责 |
+| **PENDING → SENDING** | ✅ [L334-L337](file:///d:/fz/0601-1/solo-dogfeeding/code/51-plunk/apps/api/src/services/EmailService.ts#L334-L337) | ✅ [L124-L127](file:///d:/fz/0601-1/solo-dogfeeding/code/51-plunk/apps/api/src/jobs/email-processor.ts#L124-L127) |
+| **PENDING → FAILED (域名未验证)** | ✅ 由 `verifyEmailDomain` throw 进入 catch 块 | ❌ 无此路径（由 SES 报错触发，见下） |
+| **PENDING → FAILED (未订阅)** | ✅ [L317-L323](file:///d:/fz/0601-1/solo-dogfeeding/code/51-plunk/apps/api/src/services/EmailService.ts#L317-L323)，直接 return 不 throw | ❌ **无** |
+| **PENDING → FAILED (项目禁用)** | ❌ **无检查** | ✅ [L104-L120](file:///d:/fz/0601-1/solo-dogfeeding/code/51-plunk/apps/api/src/jobs/email-processor.ts#L104-L120)，额外 `finalizeIfDone` campaign |
+| **SENDING → SENT** | ✅ [L422-L429](file:///d:/fz/0601-1/solo-dogfeeding/code/51-plunk/apps/api/src/services/EmailService.ts#L422-L429)，仅写 `sentAt + messageId` | ✅ [L232-L239](file:///d:/fz/0601-1/solo-dogfeeding/code/51-plunk/apps/api/src/jobs/email-processor.ts#L232-L239)，字段一致 |
+| **SENDING → FAILED (catch)** | ✅ [L446-L452](file:///d:/fz/0601-1/solo-dogfeeding/code/51-plunk/apps/api/src/services/EmailService.ts#L446-L452) | ✅ [L270-L276](file:///d:/fz/0601-1/solo-dogfeeding/code/51-plunk/apps/api/src/jobs/email-processor.ts#L270-L276) |
+| **POST-SENT 事件** | ✅ 调 `EventService.trackEvent('email.sent')` [L432-L441](file:///d:/fz/0601-1/solo-dogfeeding/code/51-plunk/apps/api/src/services/EmailService.ts#L432-L441) | ✅ 同样调 `EventService.trackEvent` [L254-L260](file:///d:/fz/0601-1/solo-dogfeeding/code/51-plunk/apps/api/src/jobs/email-processor.ts#L254-L260) |
+| **计费上报 (Meter)** | ❌ **无** | ✅ `MeterService.recordEmailSent` [L244-L248](file:///d:/fz/0601-1/solo-dogfeeding/code/51-plunk/apps/api/src/jobs/email-processor.ts#L244-L248)，含附件×2 计费 |
+| **Campaign 收敛** | ❌ **无** | ✅ `CampaignService.finalizeIfDone` [L263-L265](file:///d:/fz/0601-1/solo-dogfeeding/code/51-plunk/apps/api/src/jobs/email-processor.ts#L263-L265) |
+| **钓鱼检测命中禁用项目** | ❌ **无** | ✅ 禁用项目 + 调 `QueueService.cancelAllProjectJobs` [L193-L212](file:///d:/fz/0601-1/solo-dogfeeding/code/51-plunk/apps/api/src/jobs/email-processor.ts#L193-L212) |
+
+**结论**：Worker 链路的状态更新是"完整版"，包含安全、计费、campaign 联动；同步链路只做了最小可用的状态流转。
+
+---
+
+### 5. 失败处理（两条链路结构相似，Worker 链路多一层 BullMQ 重试）
+
+| 阶段 | 同步链路 | Worker 链路 |
+|------|---------|------------|
+| **catch 结构** | try-catch 包裹整个发送流程 [L328-L455](file:///d:/fz/0601-1/solo-dogfeeding/code/51-plunk/apps/api/src/services/EmailService.ts#L328-L455) | try-catch 包裹整个发送流程 [L128-L279](file:///d:/fz/0601-1/solo-dogfeeding/code/51-plunk/apps/api/src/jobs/email-processor.ts#L128-L279) |
+| **catch 动作** | ① `signale.error` 日志<br>② `status=FAILED` + 写 `error` 字段<br>③ `throw error` 向上抛出 | ① `signale.error` 日志（带 attemptId）<br>② 取 `attemptsMade + 1 === maxAttempts` 做 `isFinalAttempt` 判断（但**实际未使用**该变量）<br>③ `status=FAILED` + 写 `error` 字段<br>④ `finalizeIfDone` campaign（仅 campaign 邮件）<br>⑤ `throw error` 向上抛出 |
+| **BullMQ 重试** | ❌ 无（同步调用无队列机制） | ✅ 有（队列配置 `attempts: 3` + 指数退避），但因 catch 块已先置 FAILED，**重试会被 PENDING guard 拦截为空转**（详见第五章 5.4） |
+| **未订阅处理** | 不抛异常，return 静默结束（不触发任何重试/补偿） | ❌ 无此场景（不做检查） |
+| **项目禁用处理** | ❌ 不检查 | 不抛异常，return 静默结束 + finalize campaign |
+| **钓鱼检测处理** | ❌ 不检查 | `phishingResult.shouldDisable` 时先禁用项目 + 取消所有作业，再抛异常触发 FAILED 写入 |
+
+---
+
+### 6. 两条链路独有的职责清单
+
+| 功能 | 仅同步链路有 | 仅 Worker 链路有 |
+|------|:-----------:|:--------------:|
+| SES 发送前域名有效性校验 (`verifyEmailDomain`) | ✅ | ❌ |
+| SES 发送前订阅状态二次校验 | ✅ | ❌ |
+| BullMQ 速率限制 (rate × 每秒) + 并发控制 | ❌ | ✅ |
+| 项目禁用状态检查 (`project.disabled`) | ❌ | ✅ |
+| LLM 钓鱼内容检测 (`checkPhishingContent`) + 采样率 | ❌ | ✅ |
+| Stripe 计费 MeterEvent 上报（含附件加权） | ❌ | ✅ |
+| Campaign finalize 状态收敛 | ❌ | ✅ |
+| 收件人姓名注入 `to.name` | ❌ | ✅ |
+| `project.replyTo` 作为 replyTo 回退值 | ❌ | ✅ |
+| 项目禁用级联清理 (`cancelAllProjectJobs`) | ❌ | ✅ |
+| `X-Plunk-Recipient-Override` header 处理 | ✅ (公共 header 处理一致) | ✅ (公共 header 处理一致) |
+
+---
+
+### 7. 架构设计意图推断
+
+从代码差异可以推断出**演进路径**和**设计分工**：
+
+```
+阶段 1 (MVP):
+  EmailService.sendEmail ← 同步直发，所有逻辑都在这里
+  包含：域名校验 + 订阅校验 + 状态更新 + SES 调用
+
+阶段 2 (规模化):
+  引入 BullMQ → 抽取 Email + QueueService
+  Worker 内"重写"了一份 sendEmail 流程（email-processor.ts）
+  为生产场景新增：项目禁用检查 / 钓鱼检测 / 计费 / campaign 联动 / 速率控制
+  但遗漏了同步链路原有的：域名校验 / 订阅二次校验 ← 技术债
+
+现状:
+  同步链路 → 测试专用 / 历史遗留 / 文档上说是 Worker 调它但实际 Worker 没调
+  Worker 链路 → 真正的生产路径
+```
+
+> **证据**：`EmailService.sendEmail` 的注释写着 "This is called by the email processor worker"，但 [email-processor.ts](file:///d:/fz/0601-1/solo-dogfeeding/code/51-plunk/apps/api/src/jobs/email-processor.ts) 全程没有调用 `EmailService.sendEmail()`，而是内联实现了整个流程。注释与实现不一致，说明中间重构时 Worker 从"调用同步方法"改成了"内联重写"，但同步方法没被删除、注释没更新，形成了当前"两条并行链路"的状态。
+
+---
+
 ## 二、邮件任务入队流程
 
 ### 2.1 三条入队路径
