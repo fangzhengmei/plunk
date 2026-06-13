@@ -981,3 +981,211 @@ Job ack
 4. completion 条件从"currentStepId is null"改成"所有可达出口都 COMPLETED"
 
 在当前版本里，UI 层（DAG 编辑器）允许画出多对多的箭头是一种"未来扩展性"的提前设计，但引擎语义上等价于一个 `switch-case`。
+
+---
+
+## 十七、Redis 重启/无持久化时 BullMQ 任务与 DB 状态的失同步
+
+### BullMQ 的数据全部落在 Redis，DB 是"快照"而非"真相源"
+
+Plunk 对工作流调度做了**双写**：一份在 **PostgreSQL**（WorkflowExecution / WorkflowStepExecution 的 status、scheduledFor、executeAfter 等字段），另一份在 **Redis**（BullMQ 的 Stream + Hash + ZSet 全部状态）。但在运行和恢复决策上，**代码只认 Redis BullMQ，不认 DB 里的时间字段**。
+
+```
+                     双写写入               只从 BullMQ 读
+┌──────────────┐ ──────────────▶ ┌───────────┐ ◀────────────── ┌──────────────┐
+│  PostgreSQL  │                  │   Redis   │                  │ Worker 进程  │
+│  (status +   │                  │ (BullMQ + │                  │  (推进决策)   │
+│   scheduled) │◀─ 回查兜底 ──────│  缓存)    │                  │              │
+└──────────────┘                  └───────────┘                  └──────────────┘
+```
+
+### Redis 整体失效的两种典型场景
+
+| 场景 | 触发条件 | Redis 状态 |
+|------|---------|-----------|
+| **Redis 冷重启（AOF/RDB 未开启或丢失）** | `redis-server` 重启但 `appendonly no` / `save ""`，或运维误删 `dump.rdb` | 内存全空，Queue、Worker、Job、repeatable 元信息全部消失 |
+| **Redis 网络分区 / 超时导致连接全断** | 跨机房抖动、`maxRetriesPerRequest=null` 策略下 ioredis 抛错 | 短时间读写全部失败（`enableReadyCheck=false` 让连接不做前置健康检查，失败暴露到首次读写） |
+
+### Redis 失效后，各类工作流状态的"失同步"后果
+
+代码里 **没有任何一条链路** 会在 Redis 恢复后，用 DB 的 `(status, scheduledFor, executeAfter)` 回扫重建 BullMQ Job。这导致不同步骤状态的后果天差地别：
+
+| DB 状态 | Redis 对应内容 | Redis 全空后的后果 | 代码里是否有"DB 侧自救" |
+|--------|--------------|------------------|----------------------|
+| WorkflowExecution.status=**RUNNING**，currentStepId=某步骤（非 WAITING/DELAY） | BullMQ 里应存在一个 process-step Job | 这条 RUNNING 的 execution **永远停在那**，没人推进。除非外部再触发一次能 handleEvent 的事件唤醒它。 | ❌ 无，启动时不扫 RUNNING |
+| WorkflowStepExecution.status=**WAITING**，step.type=**WAIT_FOR_EVENT**，executeAfter 已过期 | BullMQ 里应存在一个 `workflow-timeout-${stepExecutionId}` 的 delayed Job | timeout Job 丢失 → execution 永久 WAITING，除非事件到达（handleEvent 是 DB 直查，不依赖 Redis）。若事件永远不来，就僵尸化。 | ⚠️ 部分：事件到达能救，但超时无人管 |
+| WorkflowExecution.status=**WAITING**，前一步是 **DELAY** | BullMQ 里应存在一个 `workflow-${executionId}-${nextStepId}` 的 delayed Job | delay Job 丢失 → 永远等不到 next step 被唤醒，execution 停在 WAITING。DB 里连"该从哪一步继续"的线索都没有（DELAY 步骤的 nextStepId 只在 BullMQ 的 job.data 里，不在 DB）。 | ❌ 无，DB 没存下 nextStepId 对应关系 |
+| WorkflowStepExecution.status=**RUNNING/PENDING**（进程在 executeStep 中崩了） | BullMQ 里应存在一个 active Job，有 30s 锁 | stall 机制依赖 Redis，Redis 空了 stall 也没了。这条 RUNNING/PENDING 的 step 永远"进行中"。 | ❌ 无 |
+| WorkflowExecution.status=**COMPLETED/FAILED/EXITED/CANCELLED** | 无（Job 已 removeOnComplete/Fail 清了） | ✅ 无影响，DB 就是最终态 | — |
+
+### DELAY 步骤尤其脆弱：nextStepId 只存在于 BullMQ Job.data
+
+DELAY 步骤执行完后的推进代码在 [executeDelay L648-L660](file:///d:/fz/0601-1/solo-dogfeeding/code/57-plunk/apps/api/src/services/WorkflowExecutionService.ts#L648-L660)：
+
+```typescript
+const transitions = await prisma.workflowTransition.findMany({
+  where: {fromStepId: _step.id}, orderBy: {priority: 'asc'}, include: {toStep: true},
+});
+// ...
+await QueueService.queueWorkflowStep(_execution.id, nextStep.id, delayMs);
+```
+
+**`nextStep.id` 只作为 BullMQ Job 的 job.data 存入 Redis，DB 的 WorkflowExecution.currentStepId 此时仍是 WAITING 状态下的 null 或 DELAY 步骤自己**（DELAY 在 L626-L637 先把 stepExecution 标 COMPLETED，然后 L640-L645 把 execution 标 WAITING，但 currentStepId **没更新为 nextStepId**）。
+
+这意味着一旦 Redis 丢了：
+- DB 里只知道 execution 处于 WAITING
+- 不知道它应该在"delayMs 之后跳到哪个具体 nextStep"
+- 即使人工运维脚本扫 DB 也无法 100% 恢复 — 需要重放一遍 outgoingTransitions 的条件判断
+
+---
+
+## 十八、API 主进程周期任务的多副本重复入队与兜底
+
+### 三条 Repeatable Job 注册在 app.ts 启动阶段
+
+API 主进程（[app.ts L456-L499](file:///d:/fz/0601-1/solo-dogfeeding/code/57-plunk/apps/api/src/app.ts#L456-L499)）启动时同步注册三条 BullMQ repeatable job：
+
+| jobId 固定值 | 队列 | cron | 职责 |
+|-------------|------|------|------|
+| `domain-verification-repeatable` | domainVerificationQueue | `*/5 * * * *`（每 5 分钟） | 扫 AWS SES 域验证状态 |
+| `segment-count-repeatable` | segmentCountQueue | `*/5 * * * *` | 计算 Segment 成员数变化 + 触发事件 |
+| `api-request-cleanup-repeatable` | apiRequestCleanupQueue | `0 3 * * *`（每天 3 点） | 清理旧 ApiRequest 日志 |
+
+每条都写了 `jobId: 'xxx-repeatable'`（固定字符串），这是多副本去重的关键。
+
+### BullMQ Repeatable Job 的去重机制
+
+BullMQ 对 repeatable job 使用 `repeatJobKey`（由 name + queue + repeat pattern 组合的哈希）在 Redis 的 `repeat:<queueName>` ZSet 里唯一登记。多副本同时 `.add()`：
+
+1. **第一份到达的**：Lua Script 原子写入 `repeat:xxx` ZSet → OK，创建第一条实际的 delayed Job
+2. **后续副本到达的**：`repeatJobKey` 已存在于 ZSet → **静默幂等**，不会重复创建 repeatable 定义，也不会报错
+3. 实际到期触发时，BullMQ 仍然只产出一条普通 Job 入队 → 被单个 Worker 认领执行
+
+因此，**重复启动多个 API 副本不会让"周期定义"被登记多次**，`jobId` 只是锦上添花（让重复定义在 Redis 里也有稳定的 id），真正的幂等来自 BullMQ 内部的 ZSet 唯一性。
+
+### 三条周期任务的"多副本并发跑"风险分层
+
+尽管 repeatable 定义只有一份，但实际生成的 Job 在被 Worker 认领时——如果系统有多个 Worker 副本同时在跑，BullMQ 仍然会竞争式认领，只有一个副本拿到锁执行，所以**Worker 端已经天然安全**。
+
+真正需要关心的是任务本身的逻辑是否"执行两次"也没事：
+
+| 任务 | 是否幂等 | 说明 |
+|------|---------|------|
+| 域验证扫描 | ✅ 幂等 | 对已验证/未验证的域都查一次 AWS SES API，不会产生副作用 |
+| Segment 计数更新 | ⚠️ 半幂等 | [L? 实际] 重跑会再次触发 `segment.membership.changed` 事件 → 下游工作流可能被触发两次（但 count 值最终一致） |
+| API 日志清理 | ✅ 幂等 | DELETE WHERE createdAt < cutoff，执行两次结果一样 |
+
+### 周期任务的"重复入队兜底"与缺失项
+
+| 兜底手段 | 是否存在 | 说明 |
+|---------|---------|------|
+| BullMQ repeatable ZSet 幂等登记 | ✅ | 多副本启动不会多注册 |
+| BullMQ active 锁 → 单副本认领执行 | ✅ | 到期只一个 Worker 跑到 |
+| 业务级 SETNX 抢主 | ❌（NtfyService 里有类似模式，[notifySecurityWarning L228](file:///d:/fz/0601-1/solo-dogfeeding/code/57-plunk/apps/api/src/services/NtfyService.ts#L228) 用了 `SET NX`，但周期任务没用到） | 若业务不可幂等，可参考此模式加 1 分钟互斥锁 |
+| repeatable 定义在 Redis 重启后是否自动重建 | ✅（间接） | API 进程重启时总会再走一遍 app.ts 的 `.add()` → 重新写入 Redis。但如果 **Redis 清空了而 API 进程没重启**，repeatable 就消失了，下一次调度永远不会触发。 |
+
+**脆弱点：Redis 清空但 API 进程存活** 时，没有后台线程定期"health check + 重新注册 repeatable"。需要手动滚动重启 API Pod 或手动重调 `.add()`。
+
+---
+
+## 十九、allowReentry=false 的先查后插时序宽度与并发重复执行
+
+### 代码位置：EventService.startWorkflowForContact
+
+去重检查在 [EventService L434-L460](file:///d:/fz/0601-1/solo-dogfeeding/code/57-plunk/apps/api/src/services/EventService.ts#L434-L460)，按 `allowReentry` 分为两种模式：
+
+```typescript
+if (!workflow.allowReentry) {
+  // 模式A：只要这个 (workflowId, contactId) 历史上跑过 ANY status，就拒绝
+  const existingExecution = await prisma.workflowExecution.findFirst({
+    where: { workflowId, contactId },   // ← 不看 status，任何记录都算
+  });
+  if (existingExecution) return;
+} else {
+  // 模式B：只要有 RUNNING 状态的在跑，就拒绝；COMPLETED/FAILED 可以再进
+  const runningExecution = await prisma.workflowExecution.findFirst({
+    where: { workflowId, contactId, status: 'RUNNING' },
+  });
+  if (runningExecution) return;
+}
+
+// ↓ 到这里认为"没冲突"，开始创建
+const execution = await prisma.workflowExecution.create({
+  data: { workflowId, contactId, status: 'RUNNING', currentStepId, context },
+});
+```
+
+### DB 层没有 (workflowId, contactId) 唯一约束
+
+当前索引见 [schema.prisma L468-L471](file:///d:/fz/0601-1/solo-dogfeeding/code/57-plunk/packages/db/prisma/schema.prisma#L468-L471)：
+
+```prisma
+@@index([workflowId, contactId])   // ← 只是普通索引，不是 UNIQUE
+@@index([workflowId, status])
+@@index([contactId, status])
+@@index([status, currentStepId])
+```
+
+**没有任何 `@@unique` 覆盖 (workflowId, contactId)**，更没有条件唯一索引（如 `UNIQUE NULLS NOT DISTINCT WHERE status='RUNNING'`）。
+
+### 时序窗口到底有多宽
+
+```
+时间轴 ──────────────────────────────────────────────────────────────▶
+
+T0: 事件A到达 → API 实例P1 → EventService.trackEvent(e1)
+      └─ startWorkflowForContact(W1, C1):
+          T0+1ms   findFirst(W1,C1) → 返回 null（尚无记录）
+          T0+3ms   认为"安全"，开始 create 前的其它准备（构造 context 等）
+
+T0+2ms: 事件B到达（同一 SES Webhook 重试 / 同一浏览器刷两次 / 同事件走两条触发路径）
+      → API 实例P2 → EventService.trackEvent(e1 同样)
+          T0+2.5ms findFirst(W1,C1) → 返回 null（P1 还没写进去）
+          T0+4ms   认为"安全"
+
+T0+5ms:  P1 write execution=id_A, status=RUNNING  ← 写入成功
+T0+6ms:  P2 write execution=id_B, status=RUNNING  ← 也写入成功！（DB不拦）
+
+结果：同一个 (W1, C1) 出现两条 RUNNING 执行
+```
+
+**这个时序窗口 ≈ 从 findFirst 返回 `null` 的时刻 到 create 行真正 commit 的时刻**，在正常网络下大约 **1 ms ~ 50 ms**，取决于：
+- Node.js 事件循环里这两个 await 之间的微/宏任务拥塞
+- PostgreSQL RTT 与负载
+- 同一条事件是否经过多条路径（例如 SNS Webhook 的 200 OK 延迟导致 AWS 重试 + 用户同时调了 `/events/track`）
+
+### 哪些场景最容易撞出重复
+
+| 触发场景 | 撞窗概率 | 说明 |
+|---------|---------|------|
+| **同一次 SNS/SES 事件被 AWS 重试** | 中 | SES 对 200 OK 响应慢时会重投，间隔往往在秒级，但如果 API 侧慢到 AWS 判定超时，第二次投递和第一次写 DB 可能同帧 |
+| **用户同时 POST /events/track + SES 事件自然到达** | 低~中 | 两条不同入口几乎同时命中同一个 `eventName + contactId` |
+| **同一 workflow 多个 trigger**（事件名相同但入口不同） | 中 | 如果 `triggerWorkflows()` 遍历到两个 match 的 workflow（目前代码看 triggerConfig.eventName 精确匹配，通常不会；除非 DB 里同名事件配了两条 workflow） |
+| **Redis 工作流缓存失效瞬间 + 高并发事件** | 低 | `triggerWorkflows()` 走缓存 miss → 查 DB → 两条事件同时 startWorkflowForContact 同一个 C |
+
+### allowReentry 的两种模式的撞窗后果差异
+
+| 模式 | 撞窗后 DB 状态 | 业务后果 |
+|------|--------------|---------|
+| `allowReentry=false`（历史任何记录都禁） | 两条甚至多条 execution，全部 RUNNING → 之后各自跑完变 COMPLETED | 同一联系人被"同一工作流"处理多次：发多封邮件、打多次 webhook |
+| `allowReentry=true`（只禁 RUNNING 冲突） | 同上 | 理论上允许"跑完再次跑"，但这里的 bug 是"同时跑两条并行"，违反语义上的"只有一个 RUNNING" |
+
+### 对比：NtfyService 里的 SET NX 模式（正确做法的参照）
+
+[NtfyService.notifySecurityWarning L224-L231](file:///d:/fz/0601-1/solo-dogfeeding/code/57-plunk/apps/api/src/services/NtfyService.ts#L224-L231)：
+
+```typescript
+const cacheKey = `ntfy:security:warning:${projectId}`;
+const wasSet = await redis.set(cacheKey, '1', 'EX', ttl, 'NX');
+if (!wasSet) return;  // 原子地"查+写"，无时序窗口
+```
+
+对比 `startWorkflowForContact`：它用的是"两次 DB 往返的 findFirst + create"，没有 Redis SET NX 也没有事务级 `INSERT ... ON CONFLICT DO NOTHING`，天然带竞态窗口。
+
+### 真正根治需要两处改动
+
+1. **DB 层**：根据 allowReentry 语义加唯一约束
+   - `allowReentry=false`：`@@unique([workflowId, contactId])` — 历史上有就不能再插
+   - `allowReentry=true`：PostgreSQL 用部分唯一索引 `CREATE UNIQUE INDEX ... WHERE status='RUNNING'` — 允许多条但只能有一条 RUNNING
+
+2. **应用层**：用 `prisma.$transaction` 或 `INSERT ... ON CONFLICT DO NOTHING RETURNING *` 把 findFirst + create 合成一次原子操作，把"先查后插"变成"要么插成功要么返回已有行"。
