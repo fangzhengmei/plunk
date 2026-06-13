@@ -128,6 +128,167 @@ EventService / MeterService / CampaignService (后置处理)
 
 ---
 
+### 5.1 Campaign finalizeIfDone 分支完整性分析 — 风控命中与异常分支缺失导致 Campaign 卡在 SENDING
+
+Worker 链路中 `CampaignService.finalizeIfDone`（[CampaignService.ts#L541-L587](file:///d:/fz/0601-1/solo-dogfeeding/code/51-plunk/apps/api/src/services/CampaignService.ts#L541-L587)）的终止条件是 `processedCount >= totalRecipients`。其中 `processedCount` 定义为 DB 中 `status IN (SENT, FAILED)` 的邮件总数。理论上只要所有邮件都落到了 SENT 或 FAILED 终态，Campaign 就应自动从 SENDING → SENT。但 `finalizeIfDone` 的调用路径不完整，存在两条分支**已写 FAILED 却没调收敛函数**，导致 processedCount 在 DB 中虽已达标但 finalize 永远不触发：
+
+#### 5 条退出路径的 finalize 覆盖情况
+
+| # | 退出路径 | 代码位置 | status 终态 | 是否调用 finalizeIfDone | 缺失后果 |
+|---|---------|---------|:----------:|:---------------------:|---------|
+| 1 | **项目禁用早返**（try 外） | [email-processor.ts#L104-L119](file:///d:/fz/0601-1/solo-dogfeeding/code/51-plunk/apps/api/src/jobs/email-processor.ts#L104-L119) | FAILED | ✅ 有（[L116-L118](file:///d:/fz/0601-1/solo-dogfeeding/code/51-plunk/apps/api/src/jobs/email-processor.ts#L116-L118)） | — |
+| 2 | **status ≠ PENDING 早返** | [email-processor.ts#L99-L101](file:///d:/fz/0601-1/solo-dogfeeding/code/51-plunk/apps/api/src/jobs/email-processor.ts#L99-L101) | 不修改 | ❌ 无 | 无后果（终态已在之前触发过 finalize） |
+| 3 | **⚠️ 风控/phishing 命中 throw**（try 内） | [email-processor.ts#L193-L211](file:///d:/fz/0601-1/solo-dogfeeding/code/51-plunk/apps/api/src/jobs/email-processor.ts#L193-L211) | FAILED | ❌ **无** | `prisma.email.update` 写 FAILED → throw Error 跳出，但 `campaignId` 分支无任何收敛调用。processedCount 增加了，Campaign 却永远等不到 finalize |
+| 4 | **SES 调用成功** | [email-processor.ts#L263-L265](file:///d:/fz/0601-1/solo-dogfeeding/code/51-plunk/apps/api/src/jobs/email-processor.ts#L263-L265) | SENT | ✅ 有 | — |
+| 5 | **⚠️ 外层 catch 分支**（try 外） | [email-processor.ts#L266-L278](file:///d:/fz/0601-1/solo-dogfeeding/code/51-plunk/apps/api/src/jobs/email-processor.ts#L266-L278) | FAILED | ❌ **无** | 以下异常都算在此分支：<br>① SES 网络/配额错误 (sendRawEmail throw)<br>② Prisma 连接中断 / SQL 错误<br>③ 模板格式化/编译内部抛错<br>④ SecurityService.checkPhishingContent 网络超时<br>⑤ OpenRouter LLM 调用失败<br>这些场景同样：DB 写 FAILED，processedCount +1，但 finalize 不触发 |
+
+#### 具体卡住场景（风控拦截路径）
+
+```
+Campaign totalRecipients = 1000
+  ↓
+其中第 327 封邮件 checkPhishingContent() 返回 shouldDisable = true
+  ↓
+[L203-L209] prisma.email.update({status: FAILED})  ← processedCount DB 中 +1
+[L211] throw Error("Project has been disabled...")
+  ↓
+throw 跳出 try 块，不执行 try 末尾的 [L263-L265] finalizeIfDone
+  ↓
+最终 processedCount = 1000（因为 SecurityService.disableProjectForPhishing
+   会调 cancelAllProjectJobs，它里面会批量 updateMany 把所有 PENDING → FAILED）
+但 finalizeIfDone 从未被触发 → Campaign 永远停在 status=SENDING
+```
+
+> **补充说明**：虽然 `cancelAllProjectJobs` 在批量把 PENDING → FAILED 之后确实**有**一段 finalizeIfDone 逻辑（见 [QueueService.ts#L636-L640](file:///d:/fz/0601-1/solo-dogfeeding/code/51-plunk/apps/api/src/services/QueueService.ts#L636-L640)），但它遍历的是"当前还处于 SENDING 状态的 Campaigns"，而 [L211] throw 时第 327 封的 Email 只是单封被写入 FAILED，Campaign 本身仍处于 SENDING，所以**只有在 cancelAllProjectJobs 的批处理跑完后才会收敛**——但 phishing 分支**那一封**触发 throw 的邮件自身没有调 finalize。若项目禁用的批处理过程中出现异常（例如 Redis 连接抖动），Campaign 就永久卡住。
+
+#### 具体卡住场景（SES 异常路径）
+
+```
+Campaign totalRecipients = 1000
+  ↓
+成功发送 990 封 → finalize 触发 990 次，每次 processedCount = 990 < 1000，return
+  ↓
+剩下 10 封的 sendRawEmail() 因 AWS SES 出现 Throttling / MessageRejected 等异常
+  ↓
+每封都走到 catch 块：[L270-L275] prisma.email.update({status: FAILED})
+                    [L278] throw error
+  ↓
+最终 DB 中 processedCount = 990 + 10 = 1000 >= 1000
+但 finalizeIfDone 从来没以 processedCount = 1000 的状态被调用过
+  ↓
+Campaign 永远卡在 SENDING，前端一直显示"发送中"，无任何告警
+```
+
+#### 修复方向
+
+在 phishing 命中分支 ([L203-L211] 之间) 与外层 catch 分支 ([L266-L278] 之间)，当 `email.campaignId != null` 时补充调用 `CampaignService.finalizeIfDone(email.campaignId)`。`status !== PENDING` 那条早返分支可不调，因为终态邮件通常之前已经触发过收敛。
+
+---
+
+### 5.2 BullMQ 重试被两层业务逻辑短路 — `attempts: 3` 加指数退避实际无效
+
+队列配置 ([QueueService.ts#L47-L54](file:///d:/fz/0601-1/solo-dogfeeding/code/51-plunk/apps/api/src/services/QueueService.ts#L47-L54)) 声明了 `attempts: 3` + `backoff: {type: 'exponential', delay: 2000}`，意图是失败后以 2s → 4s → 8s 的退避节奏重试 3 次。但业务侧写了两段与之冲突的逻辑，导致重试机制完全不生效，`attempts: 3` 形同虚设：
+
+#### 第一层短路：catch 块先置 FAILED 再 rethrow（冲突源头）
+
+[email-processor.ts#L266-L278](file:///d:/fz/0601-1/solo-dogfeeding/code/51-plunk/apps/api/src/jobs/email-processor.ts#L266-L278) 的 catch 执行顺序是：
+
+```ts
+catch (error) {
+  signale.error(...);                                   // 日志
+
+  await prisma.email.update({                           // ① 先把 status 写为终态 FAILED
+    where: {id: emailId},
+    data: {status: EmailStatus.FAILED, error: ...},
+  });
+
+  throw error;                                          // ② 再抛给 BullMQ 触发重试
+}
+```
+
+根据 BullMQ 的语义，`throw` 会让 job 进入 `failed` 状态，随后按 `backoff` 延迟后再次执行 Worker handler。但问题在于——**下一次 handler 执行时，status 已经是 FAILED 了**。
+
+#### 第二层短路：Handler 入口的 `status !== PENDING` 早返（把重试吃掉）
+
+[email-processor.ts#L99-L101](file:///d:/fz/0601-1/solo-dogfeeding/code/51-plunk/apps/api/src/jobs/email-processor.ts#L99-L101) 在流程最开头写了：
+
+```ts
+if (email.status !== EmailStatus.PENDING) {
+  return;   // 静默 return，不抛异常，BullMQ 认为 job 成功
+}
+```
+
+结合第一层短路，第 2、3 次重试时的完整路径是：
+
+```
+第 1 次 attempt (attemptsMade=0)：
+  status === PENDING → 通过 guard
+  sendRawEmail() throw → catch 写 FAILED → throw
+  BullMQ：第 1 次失败，delay 2000ms 后重试
+
+第 2 次 attempt (attemptsMade=1)：
+  status === FAILED ≠ PENDING → [L100] return  ✅ 静默结束，不抛错
+  BullMQ：job 标记为 completed（因为 return 没 throw）
+  ⚠️ 实际什么都没做，BullMQ 也不会再触发第 3 次重试
+```
+
+**最终效果**：`attempts: 3` 变成了"实际最多发送 1 次 SES，第 2 次 attempt 空转且提前终止 BullMQ 的重试链"，第 3 次 attempt 永远不会运行。指数退避（2s/4s/8s）也只用到了 2s 那一次。
+
+#### 附加死代码：`isFinalAttempt` 计算却未使用
+
+[email-processor.ts#L268](file:///d:/fz/0601-1/solo-dogfeeding/code/51-plunk/apps/api/src/jobs/email-processor.ts#L268) 在 catch 开头声明了：
+
+```ts
+const isFinalAttempt = attemptsMade + 1 === maxAttempts;
+```
+
+但该变量在 `email-processor.ts` 中出现的次数 = 1（只有声明，无任何 if/赋值/传参），是典型的"计算到一半忘了用"的死代码。推测原始设计意图是：只在 `isFinalAttempt === true` 时才写 FAILED 状态（之前 retries 保持 PENDING 让重试有效），以及用 `isFinalAttempt` 来判断是否发告警 / 调 finalize —— 但均未实现。
+
+#### 修复方向（若要真正启用重试）
+
+```ts
+// 伪代码：只在最后一次 attempt 才写 FAILED，之前重试保持 PENDING
+catch (error) {
+  const isFinalAttempt = job.attemptsMade + 1 >= job.opts.attempts;
+  if (isFinalAttempt) {
+    await prisma.email.update({status: FAILED, error: ...});
+    if (email.campaignId) await CampaignService.finalizeIfDone(email.campaignId);
+  } else {
+    // 保持 PENDING，允许下次 attempt 重新进入 SENDING
+    await prisma.email.update({status: PENDING});
+  }
+  throw error;
+}
+```
+
+---
+
+### 5.3 两条链路的共享与复制边界 — 三个静态方法共享调用，仅状态机与外发参数构造被复制
+
+修正"Worker 内联实现了整个流程"的不准确表述。两条链路**既不是完全独立**，也不是简单的调用关系，而是**部分共享 + 部分复制**的混合架构：
+
+#### 三个共享的 EmailService 静态方法（两边调用同一份实现）
+
+| 功能 | 方法签名 | Worker 调用位置 | 同步链路调用位置 | 共享性 |
+|------|---------|----------------|-----------------|:------:|
+| **变量替换**<br>Handlebars 风格 `{{key}}` 替换 | `EmailService.format({subject, body, data})` | [email-processor.ts#L131](file:///d:/fz/0601-1/solo-dogfeeding/code/51-plunk/apps/api/src/jobs/email-processor.ts#L131) | [EmailService.ts#L344](file:///d:/fz/0601-1/solo-dogfeeding/code/51-plunk/apps/api/src/services/EmailService.ts#L344) | ✅ 同一份实现，零差异 |
+| **HTML 编译**<br>插入退订页脚 + Powered by 徽章 | `EmailService.compile({content, contact, project, includeUnsubscribe})` | [email-processor.ts#L146](file:///d:/fz/0601-1/solo-dogfeeding/code/51-plunk/apps/api/src/jobs/email-processor.ts#L146) | [EmailService.ts#L360](file:///d:/fz/0601-1/solo-dogfeeding/code/51-plunk/apps/api/src/services/EmailService.ts#L360) | ✅ 同一份实现，零差异 |
+| **追踪决策**<br>根据项目 setting + 邮件类型判断是否启 SES 追踪集 | `EmailService.shouldTrackEmail(trackingSetting, sourceType)` | [email-processor.ts#L182](file:///d:/fz/0601-1/solo-dogfeeding/code/51-plunk/apps/api/src/jobs/email-processor.ts#L182) | [EmailService.ts#L402](file:///d:/fz/0601-1/solo-dogfeeding/code/51-plunk/apps/api/src/services/EmailService.ts#L402) | ✅ 同一份实现，零差异 |
+
+#### 两个被复制的模块（两边各自内联，存在差异）
+
+| 模块 | Worker 链路 | 同步链路 | 关键差异 |
+|------|------------|---------|---------|
+| **状态机** | [email-processor.ts#L104-L276](file:///d:/fz/0601-1/solo-dogfeeding/code/51-plunk/apps/api/src/jobs/email-processor.ts#L104-L276) 内联实现 | [EmailService.ts#L309-L452](file:///d:/fz/0601-1/solo-dogfeeding/code/51-plunk/apps/api/src/services/EmailService.ts#L309-L452) 内联实现 | Worker 多了：项目禁用检查 + finalize、钓鱼检测 + disableProject、计费上报、Campaign finalize；<br>同步多了：域名校验、订阅二次校验 |
+| **sendRawEmail 参数构造** | [email-processor.ts#L156-L229](file:///d:/fz/0601-1/solo-dogfeeding/code/51-plunk/apps/api/src/jobs/email-processor.ts#L156-L229) 内联实现 | [EmailService.ts#L370-L419](file:///d:/fz/0601-1/solo-dogfeeding/code/51-plunk/apps/api/src/services/EmailService.ts#L370-L419) 内联实现 | Worker 用 `email.toName` 填 `to.name`、有附件计费加权、支持 `recipient` 对象/字符串二选一；<br>同步链路只用 `[email]` 字符串数组 |
+
+#### 正确的架构描述
+
+Worker 没有"调用 `EmailService.sendEmail()`"（与注释矛盾），也没有"完全内联重写整个流程"。准确关系是：
+> **格式 / 编译 / 追踪决策 三个无副作用的纯函数 → 进程共享 EmailService 静态方法复用；<br>带副作用的状态机流转（读写 DB、调 SES、上报计费）+ sendRawEmail 参数构造 → 两边各写一份，独立演进，逐渐产生差异（Worker 新增能力 vs 同步链路保留校验）**
+
+---
+
 ### 6. 两条链路独有的职责清单
 
 | 功能 | 仅同步链路有 | 仅 Worker 链路有 |
@@ -148,25 +309,26 @@ EventService / MeterService / CampaignService (后置处理)
 
 ### 7. 架构设计意图推断
 
-从代码差异可以推断出**演进路径**和**设计分工**：
+从代码差异可以推断出**演进路径**和**设计分工**（基于 5.3 节的共享调用结论修正）：
 
 ```
 阶段 1 (MVP):
   EmailService.sendEmail ← 同步直发，所有逻辑都在这里
-  包含：域名校验 + 订阅校验 + 状态更新 + SES 调用
+  包含：域名校验 + 订阅校验 + 模板处理 + 状态更新 + SES 调用
 
 阶段 2 (规模化):
   引入 BullMQ → 抽取 Email + QueueService
-  Worker 内"重写"了一份 sendEmail 流程（email-processor.ts）
-  为生产场景新增：项目禁用检查 / 钓鱼检测 / 计费 / campaign 联动 / 速率控制
-  但遗漏了同步链路原有的：域名校验 / 订阅二次校验 ← 技术债
+  Worker 内联重写了状态更新、外部检查、业务逻辑部分（email-processor.ts）
+    新增：项目禁用检查 / 钓鱼检测 / 计费 / campaign 联动 / 速率控制
+    但遗漏了同步链路原有的：域名校验 / 订阅二次校验 ← 技术债
+  模板处理部分（format / compile / shouldTrackEmail）保持共享调用 EmailService 静态方法，未重复实现
 
 现状:
-  同步链路 → 测试专用 / 历史遗留 / 文档上说是 Worker 调它但实际 Worker 没调
-  Worker 链路 → 真正的生产路径
+  同步链路 → 测试专用 / 历史遗留 / 文档上说是 Worker 调它但实际 Worker 没调 sendEmail()
+  Worker 链路 → 真正的生产路径，部分逻辑共享 EmailService 静态方法
 ```
 
-> **证据**：`EmailService.sendEmail` 的注释写着 "This is called by the email processor worker"，但 [email-processor.ts](file:///d:/fz/0601-1/solo-dogfeeding/code/51-plunk/apps/api/src/jobs/email-processor.ts) 全程没有调用 `EmailService.sendEmail()`，而是内联实现了整个流程。注释与实现不一致，说明中间重构时 Worker 从"调用同步方法"改成了"内联重写"，但同步方法没被删除、注释没更新，形成了当前"两条并行链路"的状态。
+> **证据**：`EmailService.sendEmail` 的注释写着 "This is called by the email processor worker"，但 [email-processor.ts](file:///d:/fz/0601-1/solo-dogfeeding/code/51-plunk/apps/api/src/jobs/email-processor.ts) 全程没有调用 `EmailService.sendEmail()`，而是**部分内联重写 + 部分共享调用**：内联重写了状态更新和外部检查逻辑（`PENDING→SENDING→SENT/FAILED` 流程、钓鱼检测、禁用检查、计费上报），但模板格式化（`EmailService.format` [L131](file:///d:/fz/0601-1/solo-dogfeeding/code/51-plunk/apps/api/src/jobs/email-processor.ts#L131)）、HTML 编译（`EmailService.compile` [L146](file:///d:/fz/0601-1/solo-dogfeeding/code/51-plunk/apps/api/src/jobs/email-processor.ts#L146)）仍直接调用 EmailService 静态方法。注释与实现不一致，说明中间重构时 Worker 从"调用 sendEmail()"改成了"内联拆分"，但同步方法没被删除、注释没更新，形成了当前"两条并行链路 + 部分共享"的状态。
 
 ---
 
