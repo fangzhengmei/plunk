@@ -118,43 +118,42 @@ model WorkflowExecution {
 | `COMPLETED` | 正常完成 |
 | `EXITED` | 通过 EXIT 步骤提前退出 |
 | `FAILED` | 执行失败 |
-| `CANCELLED` | 被用户手动取消 |
+| `CANCELLED` | 手动取消或项目禁用自动取消 |
 
-**exitReason 取值来源**：
-- `EXECUTED`: 正常完成（空值，不设置 exitReason）
-- `EXITED`: 通过 EXIT 步骤退出，取 step.config.reason，默认 `"exit_step"`
-- `CANCELLED`: 用户手动取消，值为 `"Cancelled by user"` 或 `"Cancelled by user (bulk cancel)"`
-- `CANCELLED`（项目禁用）: 值为 `"Project disabled"`
-- `FAILED`: 执行失败，不设置 exitReason，错误信息在 stepExecution.error 中
+**exitReason 的取值来源**（不同终态各异，部分终态为空）：
+- `COMPLETED`: 不设置 exitReason（null）
+- `EXITED`: 取 EXIT 步骤的 `config.reason`，无配置时默认 `"exit_step"`
+- `CANCELLED`（用户手动）: `"Cancelled by user"` 或 `"Cancelled by user (bulk cancel)"`
+- `CANCELLED`（项目禁用）: `"Project disabled"`
+- `FAILED`: 不设置 exitReason，错误信息记录在 StepExecution.error 中
+- 代码依据：[WorkflowExecutionService.ts#L816](file:///d:/fz/0601-1/solo-dogfeeding/code/54-plunk/apps/api/src/services/WorkflowExecutionService.ts#L816)
+
+**执行上下文（context）的写入来源**：
+`WorkflowExecution.context` 字段存储触发工作流的原始数据，仅在**创建 Execution 时一次性写入**，后续所有步骤执行中不会被修改。共有两个写入入口：
+
+| 写入入口 | 调用方 | context 来源 | 代码位置 |
+|---------|--------|-------------|---------|
+| 事件触发启动 | EventService.startWorkflowForContact() | `trackEvent()` 传入的 `data` 参数（事件载荷） | [EventService.ts#L470-L477](file:///d:/fz/0601-1/solo-dogfeeding/code/54-plunk/apps/api/src/services/EventService.ts#L470-L477) |
+| 手动 API 启动 | WorkflowService.startExecution() | 调用方传入的可选 `context` 参数 | [WorkflowService.ts#L924-L931](file:///d:/fz/0601-1/solo-dogfeeding/code/54-plunk/apps/api/src/services/WorkflowService.ts#L924-L931) |
+
+**重要**：context 一旦写入不再变更。即使后续 WAIT_FOR_EVENT 步骤被新的事件唤醒，该新事件的 data 只会记录在 StepExecution.output 中，不会更新 Execution.context。
 
 #### WorkflowStepExecution（单步执行记录）
 [schema.prisma#L475-L511](file:///d:/fz/0601-1/solo-dogfeeding/code/54-plunk/packages/db/prisma/schema.prisma#L475-L511)
 
 ```prisma
 model WorkflowStepExecution {
-  id             String               @id @default(uuid())
+  id             String                    @id @default(uuid())
   executionId    String
   stepId         String
-  status         StepExecutionStatus  @default(PENDING)
-  scheduledFor   DateTime?            // DELAY 步骤专用
-  executeAfter   DateTime?            // WAIT_FOR_EVENT 超时时间
-  output         Json?                // 步骤执行结果
-  error          String?              // 错误信息
-  startedAt      DateTime?
+  status         StepExecutionStatus       @default(PENDING)
+  output         Json?                     // 步骤输出（因类型而异）
+  error          String?                   // 错误信息
+  startedAt      DateTime                  @default(now())
   completedAt    DateTime?
+  executeAfter   DateTime?                 // 延迟/超时执行时间
 }
 ```
-
-**单步状态枚举** `StepExecutionStatus`：
-| 状态 | 说明 |
-|------|------|
-| `PENDING` | 待执行 |
-| `SCHEDULED` | 已调度（DELAY） |
-| `WAITING` | 等待事件中（WAIT_FOR_EVENT） |
-| `RUNNING` | 执行中 |
-| `COMPLETED` | 已完成 |
-| `SKIPPED` | 已跳过 |
-| `FAILED` | 执行失败 |
 
 ### 2.2 Step 配置 Schema 详解
 
@@ -193,7 +192,7 @@ model WorkflowStepExecution {
 // 1. 二元模式 (if/else)
 {
   field: string;                // 字段路径，如 "data.plan"
-  operator: string;             // equals, notEquals, contains, greaterThan 等
+  operator: string;             // 十个操作符之一
   value?: any;                  // 比较值
 }
 
@@ -206,9 +205,54 @@ model WorkflowStepExecution {
     name: string;
     operator: string;
     value?: any;
-  }>;
+  }>;  // 1~20 个分支
+  // 注意：Schema 中没有 default 配置，default 是运行时的隐式兜底
 }
 ```
+
+**CONDITION 条件字段的五个根命名空间**：
+条件表达式中的 `field` 通过点号从 `fieldData` 对象解析。顶层共有五个命名空间：
+
+| 命名空间 | 含义 | 包含内容 | 代码位置 |
+|---------|------|---------|---------|
+| `contact` | 联系人基础属性 | `email`, `subscribed`（仅两个字段） | [WorkflowExecutionService.ts#L740-L743](file:///d:/fz/0601-1/solo-dogfeeding/code/54-plunk/apps/api/src/services/WorkflowExecutionService.ts#L740-L743) |
+| `data` | 联系人自定义数据 | `contact.data` 展开的所有字段 | [WorkflowExecutionService.ts#L744](file:///d:/fz/0601-1/solo-dogfeeding/code/54-plunk/apps/api/src/services/WorkflowExecutionService.ts#L744) |
+| `workflow` | 执行上下文（别名） | `execution.context` 展开的所有字段 = 触发事件的 payload | [WorkflowExecutionService.ts#L745](file:///d:/fz/0601-1/solo-dogfeeding/code/54-plunk/apps/api/src/services/WorkflowExecutionService.ts#L745) |
+| `event` | 执行上下文（正名） | 与 `workflow` 完全相同，指向同一个 `execution.context` 对象 | [WorkflowExecutionService.ts#L746](file:///d:/fz/0601-1/solo-dogfeeding/code/54-plunk/apps/api/src/services/WorkflowExecutionService.ts#L746) |
+| `contact.data` | 兼容格式（解析时转换） | 特殊的前缀匹配规则：`contact.data.X` 解析前自动去前缀，转为 `data.X` 再查找 | [WorkflowExecutionService.ts#L1186-L1188](file:///d:/fz/0601-1/solo-dogfeeding/code/54-plunk/apps/api/src/services/WorkflowExecutionService.ts#L1186-L1188) |
+
+**示例字段路径**：
+- `contact.email` → 联系人邮箱
+- `data.firstName` → 联系⼈自定义属性 firstName
+- `workflow.orderId` → 触发事件中的 orderId（事件 payload）
+- `event.orderId` → 同上，event 是 workflow 的别名
+- `contact.data.plan` → 兼容旧写法，自动转换为 `data.plan`
+
+**CONDITION 十个操作符及未知操作符处理**：
+操作符定义在 Zod Schema 的 enum 中，并在 `evaluateCondition()` 用 switch 实现。遇到未识别操作符会**直接抛错中断执行**：
+
+| 操作符 | 说明 | null/undefined 处理 |
+|-------|------|-------------------|
+| `equals` | 严格相等 (`===`) | 可匹配 null/undefined（双方一致时） |
+| `notEquals` | 严格不等 (`!==`) | 字段为 null/undefined 时返回 false |
+| `contains` | 字符串包含 | 字段为 null/undefined 时返回 false |
+| `notContains` | 字符串不包含 | 字段为 null/undefined 时返回 false |
+| `greaterThan` | 数值大于 `>` | 字段为 null/undefined 时返回 false |
+| `lessThan` | 数值小于 `<` | 字段为 null/undefined 时返回 false |
+| `greaterThanOrEqual` | 数值大于等于 `>=` | 字段为 null/undefined 时返回 false |
+| `lessThanOrEqual` | 数值小于等于 `<=` | 字段为 null/undefined 时返回 false |
+| `exists` | 字段存在（非 null 非 undefined） | 返回 false |
+| `notExists` | 字段不存在 | 返回 true |
+
+**未知操作符**：switch 的 default 分支 `throw new Error(\`Unknown operator: ${operator}\`)`，属于**硬错误**，会导致该步骤及整个 Execution 标记为 FAILED。
+代码依据：[WorkflowExecutionService.ts#L1207-L1263](file:///d:/fz/0601-1/solo-dogfeeding/code/54-plunk/apps/api/src/services/WorkflowExecutionService.ts#L1207-L1263)
+
+**CONDITION 多分支模式 default 兜底**：
+`mode='multi'` 时，逐个遍历 `branches` 数组按 operator 评估，第一个匹配即返回其对应的 `branch.id`。如果所有 branches 都不匹配，**隐式返回 `branch='default'`**：
+- Schema 层面没有 default 的配置项，default 是执行层的内置兜底
+- 返回值：`{matchedBranch: 'default', branch: 'default', actualValue, field, mode: 'multi'}`
+- 对应 Transition 的 `condition.branch` 需配置为 `"default"` 才能被选中
+- 代码依据：[WorkflowExecutionService.ts#L749-L773](file:///d:/fz/0601-1/solo-dogfeeding/code/54-plunk/apps/api/src/services/WorkflowExecutionService.ts#L749-L773)
 
 **WEBHOOK 配置**：
 ```typescript
@@ -220,16 +264,61 @@ model WorkflowStepExecution {
 }
 ```
 
-**WEBHOOK 模板变量域**：
-变量 scope 是 SEND_EMAIL scope 的超集，包含：
-- `id`, `email` — 联系人 ID 和邮箱
-- `data` / 顶层展开的联系人属性 — 联系人自定义数据
-- 执行上下文数据（execution context）
-- `event` — 触发工作流的事件载荷（WEBHOOK 独有）
-- `unsubscribeUrl`, `subscribeUrl`, `manageUrl` — 订阅管理链接
+**WEBHOOK 模板变量域的展开覆盖陷阱**：
+变量 scope 是 SEND_EMAIL scope 的超集。构造方式为「浅层对象字面量 + 展开运算符」，**展开顺序决定覆盖优先级**，后面展开的同名字段会覆盖前面的：
 
-**注意**：`method` 字段**不参与模板渲染**，始终作为字面 HTTP 动词使用，防止模板注入导致的非预期请求方法。
-代码依据：[WorkflowExecutionService.ts#L940-L954](file:///d:/fz/0601-1/solo-dogfeeding/code/54-plunk/apps/api/src/services/WorkflowExecutionService.ts#L940-L954)
+```typescript
+const variables = {
+  id: contact.id,              // (1) 系统变量：联系人 ID
+  email: contact.email,        // (2) 系统变量：联系人邮箱
+  ...contactData,              // (3) 展开联系人自定义数据 —— 如果自定义数据含 id/email，会覆盖 (1)(2)
+  ...executionContext,         // (4) 展开执行上下文（事件payload）—— 优先级最高，会覆盖 (1)(2)(3)
+  data: contactData,           // (5) data 命名空间
+  event: context,              // (6) event 命名空间（WEBHOOK 独有）
+  unsubscribeUrl: `${DASHBOARD_URI}/unsubscribe/${contact.id}`,  // (7) 系统URL
+  subscribeUrl:   `${DASHBOARD_URI}/subscribe/${contact.id}`,    //    同(7)
+  manageUrl:      `${DASHBOARD_URI}/manage/${contact.id}`,       //    同(7)
+};
+```
+
+**覆盖陷阱总结**：
+- 第 (3)(4) 步的展开是**浅拷贝**，任意顶层键冲突都会被后面的值覆盖
+- 风险场景：
+  - 联系人自定义数据中有 `id`、`email`、`unsubscribeUrl` 等键 → 覆盖系统变量
+  - 触发事件 payload 中有上述键 → 进一步覆盖前两者
+- SEND_EMAIL 的 scope 构造逻辑相同，存在同样的覆盖陷阱
+- 代码依据：[WorkflowExecutionService.ts#L944-L954](file:///d:/fz/0601-1/solo-dogfeeding/code/54-plunk/apps/api/src/services/WorkflowExecutionService.ts#L944-L954)
+
+**WEBHOOK 的 method 不参与模板渲染**：
+`url`、`headers` 的每个值、`body` 中所有字符串值均会被模板渲染，但 `method` 字段**直接传递给 fetch，不做任何模板替换**（防止模板注入导致非预期的 HTTP 方法）。
+代码依据：[WorkflowExecutionService.ts#L956-L989](file:///d:/fz/0601-1/solo-dogfeeding/code/54-plunk/apps/api/src/services/WorkflowExecutionService.ts#L956-L989)
+
+**WEBHOOK 未配请求体时的默认载荷**：
+当配置中未提供 `body` 字段时，引擎会**自动构造一个标准化的默认 JSON 载荷**，包含四类信息：
+
+```json
+{
+  "contact": {
+    "email": "user@example.com",     // 联系人邮箱
+    "subscribed": true,              // 订阅状态
+    "data": { /* 联系⼈自定义数据 */ }   // contact.data 原样嵌入
+  },
+  "workflow": {
+    "id": "wf_xxx",                  // 工作流 ID
+    "name": "Onboarding Series"      // 工作流名称
+  },
+  "execution": {
+    "id": "exec_xxx",                // 执行实例 ID
+    "startedAt": "2025-06-13T09:00:00Z"  // 启动时间
+  },
+  "event": { /* 触发事件的 payload */ }   // execution.context
+}
+```
+
+**重要细节**：
+- 即便配置了 `body`，对于 `GET` 请求也**不会发送请求体**（`method !== 'GET'` 时才会将 payload 转为 JSON 字符串）
+- 默认载荷完全不经过模板渲染，是直接从运行时对象构造的字面量
+- 代码依据：[WorkflowExecutionService.ts#L964-L989](file:///d:/fz/0601-1/solo-dogfeeding/code/54-plunk/apps/api/src/services/WorkflowExecutionService.ts#L964-L989)
 
 **UPDATE_CONTACT 配置**：
 ```typescript
@@ -256,91 +345,81 @@ model WorkflowStepExecution {
   ├─ triggerWorkflows() → 查询匹配的 Workflow
   │   └─ 对每个匹配的 Workflow:
   │       └─ startWorkflowForContact()
-  │           ├─ 检查 re-entry 规则
-  │           ├─ 创建 WorkflowExecution (status=RUNNING)
-  │           └─ 调用 processStepExecution() 开始执行
-  └─ handleEvent() → 唤醒正在等待此事件的 WAIT_FOR_EVENT 步骤
+  │           ├─ 校验 re-entry 规则
+  │           ├─ 创建 WorkflowExecution（context = event.data）
+  │           └─ processStepExecution(triggerStep)  // 异步不等待
+  └─ handleEvent() → 唤醒 WAIT_FOR_EVENT 步骤
 ```
 
-**缓存机制**：
-- 已启用的 Workflow 列表缓存于 Redis 5 分钟
-- 缓存 Key: `Keys.Workflow.enabled(projectId)`
-- Workflow 启用/禁用/更新时通过 [invalidateWorkflowCache()](file:///d:/fz/0601-1/solo-dogfeeding/code/54-plunk/apps/api/src/services/EventService.ts#L53-L60) 失效缓存
-
 #### 方式 2：手动 API 触发
-触发入口：[WorkflowService.startExecution()](file:///d:/fz/0601-1/solo-dogfeeding/code/54-plunk/apps/api/src/services/WorkflowService.ts#L860-L941)
+入口：[WorkflowService.startExecution()](file:///d:/fz/0601-1/solo-dogfeeding/code/54-plunk/apps/api/src/services/WorkflowService.ts#L860-L941)
 
 **执行流程**：
 ```
-API 请求 → startExecution()
-  ├─ 验证 Workflow 已启用
-  ├─ 验证联系人存在
-  ├─ 检查 re-entry 规则
-  ├─ 创建 WorkflowExecution (status=RUNNING)
-  └─ 异步调用 processStepExecution()（不 await）
+API 请求 → startExecution(projectId, workflowId, contactId, context?)
+  ├─ 校验 Workflow 已 enabled
+  ├─ 校验 Contact 存在
+  ├─ 校验 re-entry 规则
+  ├─ 创建 WorkflowExecution（context = 传入参数 or null）
+  └─ processStepExecution(triggerStep)  // fire-and-forget，不 await
 ```
 
 #### 方式 3：定时调度触发（未实现）
-- `WorkflowTriggerType.SCHEDULE` 枚举值已在 schema 中声明
-- `triggerConfig` 注释中提及 `{ schedule: "0 9 * * *" }` 格式
-- **实际无任何调度执行逻辑**：没有 cron 调度器、没有定时扫描任务、没有对应的队列 worker
+`WorkflowTriggerType.SCHEDULE` 仅在枚举和 schema 注释中声明，**没有任何实际调度执行逻辑**：
+- 无 cron 调度器
+- 无定时扫描任务
+- 无对应的队列 worker 或 job processor
 - 代码依据：[schema.prisma#L681-L685](file:///d:/fz/0601-1/solo-dogfeeding/code/54-plunk/packages/db/prisma/schema.prisma#L681-L685)
 
 ### 3.2 Re-entry 规则详解
-[WorkflowService.startExecution()](file:///d:/fz/0601-1/solo-dogfeeding/code/54-plunk/apps/api/src/services/WorkflowService.ts#L886-L914)
 
-| allowReentry | 检查逻辑 | 结果 |
-|--------------|---------|------|
-| `false` | 查询是否存在 **任何** 执行记录（无论状态） | 存在则拒绝 |
-| `true` | 查询是否存在 **RUNNING** 状态的执行记录 | 存在则拒绝 |
+[WorkflowService.startExecution()](file:///d:/fz/0601-1/solo-dogfeeding/code/54-plunk/apps/api/src/services/WorkflowService.ts#L885-L914) 和 [EventService.startWorkflowForContact()](file:///d:/fz/0601-1/solo-dogfeeding/code/54-plunk/apps/api/src/services/EventService.ts#L434-L460)
 
-> **重要**：`allowReentry=true` 时，已完成/失败/退出的执行不阻止新的执行，但同一时间只能有一个运行中的实例。
+| allowReentry | 已有历史执行 | 已有 RUNNING 执行 | 结果 |
+|-------------|------------|------------------|------|
+| false | 有（任意状态） | 任意 | 禁止进入 |
+| false | 无 | 无 | 允许进入 |
+| true | 任意 | 无 | 允许进入 |
+| true | 任意 | 有 | 禁止进入 |
 
 ---
 
 ## 四、执行状态推进主链路
 
 ### 4.1 核心入口：processStepExecution()
-[WorkflowExecutionService.processStepExecution()](file:///d:/fz/0601-1/solo-dogfeeding/code/54-plunk/apps/api/src/services/WorkflowExecutionService.ts#L47-L299)
+[WorkflowExecutionService.processStepExecution()](file:///d:/fz/0601-1/solo-dogfeeding/code/54-plunk/apps/api/src/services/WorkflowExecutionService.ts#L70-L298)
 
-这是整个执行引擎的核心函数，所有步骤执行都从此进入。
-
-**执行流程图**：
+**执行流程**：
 ```
 processStepExecution(executionId, stepId)
   │
-  ├─ 前置检查
-  │   ├─ 加载 Execution + Workflow + Steps + Transitions
-  │   ├─ 状态检查：
-  │   │   ├─ WAITING → 继续（延迟步骤恢复）
-  │   │   ├─ RUNNING → 继续
-  │   │   └─ 其他状态 → 直接返回（已完成/取消/失败）
-  │   ├─ 项目禁用检查 → 若禁用，标记 CANCELLED 并返回
-  │   └─ Workflow 禁用检查 → 仅记录日志，**允许继续执行**
+  ├─ 1. 前置检查
+  │   ├─ 查询 Execution（含 workflow、steps、contact）
+  │   ├─ 状态校验：COMPLETED/FAILED/CANCELLED → 直接返回
+  │   ├─ 项目禁用检查 → 标记 CANCELLED，exitReason="Project disabled"
+  │   └─ Workflow 禁用 → 允许继续（仅阻止新启动）
   │
-  ├─ 状态校正（从 WAITING 恢复时）
-  │   └─ 更新 Execution 状态为 RUNNING
+  ├─ 2. 状态恢复
+  │   └─ WAITING → 设置回 RUNNING（延迟步骤或等待步骤恢复）
   │
-  ├─ 创建/更新 StepExecution
-  │   ├─ 存在 PENDING/RUNNING → 更新为 RUNNING
-  │   └─ 不存在 → 创建新 StepExecution (status=RUNNING)
+  ├─ 3. 创建/获取 StepExecution 记录
+  │   ├─ 存在 PENDING/RUNNING → 复用
+  │   └─ 不存在 → 创建新的 PENDING 记录
   │
-  ├─ 执行步骤（executeStep）
-  │   └─ 根据 step.type 分派到不同处理器
+  ├─ 4. 标记 StepExecution 为 RUNNING
   │
-  ├─ 步骤执行后处理
-  │   ├─ 检查 StepExecution 是否为 WAITING（WAIT_FOR_EVENT）
-  │   │   └─ 是 → 直接返回（不推进）
-  │   ├─ 检查 Execution 是否为 WAITING（DELAY 刚设置）
-  │   │   └─ 是 → 直接返回（不推进，由队列唤醒）
-  │   ├─ 标记 StepExecution 为 COMPLETED
-  │   └─ processNextSteps() → 推进到下一步
+  ├─ 5. 调用 executeStep() 执行步骤逻辑
+  │   └─ 返回 StepResult（包含分支信息、输出数据等）
   │
-  └─ 异常处理
-      ├─ 标记 StepExecution 为 FAILED
-      ├─ 标记 Execution 为 FAILED
-      ├─ 发送失败通知
-      └─ 抛出异常
+  ├─ 6. 成功处理
+  │   ├─ 标记 StepExecution 为 COMPLETED，写入 output
+  │   └─ 调用 processNextSteps() 推进下一步
+  │
+  └─ 7. 失败处理
+      ├─ 标记 StepExecution 为 FAILED，记录 error
+      ├─ 标记 Execution 为 FAILED，记录 completedAt
+      ├─ 发送 Ntfy 失败通知
+      └─ throw error → BullMQ 重试（最多 3 次）
 ```
 
 ### 4.2 步骤处理器：executeStep()
@@ -432,7 +511,7 @@ executeDelay()
 ```
 executeWaitForEvent()
   ├─ 解析配置：{eventName, timeout?}
-  ├─ 标记 StepExecution 为 WAITING
+  ├─ 标记 StepExecution 为 WAITING（stepExecution.executeAfter = timeoutDate）
   ├─ 标记 Execution 为 WAITING
   └─ timeout 存在时 → QueueService.queueWorkflowTimeout(..., timeoutMs)
       └─ 延迟 timeoutMs 后执行 processTimeout()
@@ -461,6 +540,37 @@ BullMQ 超时任务到期 → processTimeout(executionId, stepId, stepExecutionI
   ├─ 未找到但有 transitions → 推进到第一个
   └─ 无 transitions → 标记 COMPLETED
 ```
+
+**WAIT_FOR_EVENT 超时双重防御机制**：
+WAIT_FOR_EVENT 的「事件到达 vs 超时」两个唤醒路径存在竞态，引擎通过两层防御避免重复推进：
+
+| 防御层 | 实现机制 | 时机 | 代码位置 |
+|-------|---------|------|---------|
+| 第一层（队列层） | 事件到达时调用 `QueueService.cancelWorkflowTimeout(stepExecutionId)`，尝试从 BullMQ 中移除尚未执行的超时 job | handleEvent 中 | [WorkflowExecutionService.ts#L455-L456](file:///d:/fz/0601-1/solo-dogfeeding/code/54-plunk/apps/api/src/services/WorkflowExecutionService.ts#L455-L456) |
+| 第二层（状态校验层） | `processTimeout()` 在处理超时前**再次查询并校验** `stepExecution.status === WAITING`，若状态已变（事件先到了）则直接 return，不推进 | processTimeout 开头 | [WorkflowExecutionService.ts#L326-L329](file:///d:/fz/0601-1/solo-dogfeeding/code/54-plunk/apps/api/src/services/WorkflowExecutionService.ts#L326-L329) |
+
+**第一层失效场景**：
+- 超时 job 刚好已经开始执行（BullMQ 已从队列取出，cancel 无法终止正在运行的 job）
+- 网络抖动导致 Redis cancel 操作未生效
+- 上述情况下必须依赖第二层防御
+
+**两层防御的协作逻辑**：
+```
+事件到达路径 (handleEvent)                超时路径 (processTimeout)
+       │                                          │
+       ├─ 更新 status = COMPLETED (DB)            │
+       ├─ cancelWorkflowTimeout (第一层)           │
+       │    └─ 最好情况：超时job未开始 → 成功取消   │
+       │                                          │
+       │                      超时 job 已在处理中  │
+       │                          ├─ 查 status = COMPLETED (非 WAITING)
+       │                          └─ return（第二层拦截成功）
+       │                                          │
+       ▼                                          ▼
+   推进下游步骤                             不推进，安全退出
+```
+
+> 注意：虽然超时侧有双重防御，但**事件到达侧（handleEvent）缺乏同等的原子性保护**，详见 6.7 节。
 
 ### 5.3 队列与并发配置
 [QueueService.ts](file:///d:/fz/0601-1/solo-dogfeeding/code/54-plunk/apps/api/src/services/QueueService.ts#L73-L84)
@@ -574,6 +684,11 @@ try {
 - 同一事件并发到达（如多次上报、重试风暴），两个请求同时读取到同一个 WAITING 的 StepExecution
 - 两者都会更新为 COMPLETED，并都调用 `processNextSteps()` 推进
 - 可能导致同一个等待步骤被重复推进，产生重复的下游步骤执行（如重复发邮件、重复调用 webhook）
+
+**与超时侧的对比**：
+- 超时路径（processTimeout）有「二次状态校验」作为兜底
+- 事件到达路径（handleEvent）没有同等的状态检查，直接从 WAITING 更新为 COMPLETED 后立即推进
+- 这是一种**不对称的防御**
 
 **缓解措施**：
 - 步骤执行的状态更新是独立数据库操作，但整体流程无事务包裹
@@ -695,6 +810,36 @@ executeUpdateContact()
 **实际**：延迟使用 `Date.now() + delayMs` 计算，`1 day = 24 × 60 × 60 × 1000` 毫秒，**不涉及时区转换，不考虑夏令时**，就是精确的 24 小时时长。
 **代码依据**：[WorkflowExecutionService.ts#L606-L623](file:///d:/fz/0601-1/solo-dogfeeding/code/54-plunk/apps/api/src/services/WorkflowExecutionService.ts#L606-L623)
 
+### ❗ 误判点 18：CONDITION 操作符未知时会安全跳过
+**误解**：配置了拼写错误的操作符（如 `equal` 少打了 s），系统会优雅降级或跳过该条件。
+**实际**：`evaluateCondition()` 的 switch 遇到未知操作符会**直接 `throw new Error`**，这是硬错误，会导致整个步骤和执行实例标记为 FAILED。
+**代码依据**：[WorkflowExecutionService.ts#L1260-L1262](file:///d:/fz/0601-1/solo-dogfeeding/code/54-plunk/apps/api/src/services/WorkflowExecutionService.ts#L1260-L1262)
+
+### ❗ 误判点 19：CONDITION multi 模式必须配置 default 分支
+**误解**：多分支（switch/case）模式需要在配置中显式声明 default 分支，否则所有 case 都不匹配时会报错。
+**实际**：Schema 中**没有 default 的配置项**，default 是执行层的**隐式兜底**——遍历完所有 branches 仍无匹配时自动返回 `branch='default'`。只需在 Transition 层配置一条 `condition.branch='default'` 的出边即可。
+**代码依据**：[WorkflowExecutionService.ts#L765-L772](file:///d:/fz/0601-1/solo-dogfeeding/code/54-plunk/apps/api/src/services/WorkflowExecutionService.ts#L765-L772)
+
+### ❗ 误判点 20：WEBHOOK 的变量 id/email 始终是联系人的真实值
+**误解**：模板变量中的 `{{id}}` 和 `{{email}}` 永远等于联系人 ID 和邮箱。
+**实际**：`variables` 对象使用「字面量在前、展开在后」的构造方式。如果 `contact.data`（自定义数据）或 `execution.context`（事件 payload）中**恰好包含同名顶层键**，会通过展开运算符**覆盖**前面的系统变量。
+**代码依据**：[WorkflowExecutionService.ts#L944-L954](file:///d:/fz/0601-1/solo-dogfeeding/code/54-plunk/apps/api/src/services/WorkflowExecutionService.ts#L944-L954)
+
+### ❗ 误判点 21：WEBHOOK 未配置 body 时请求为空
+**误解**：不配置 `body` 字段，请求体就是空的（或空对象 `{}`）。
+**实际**：未配置 `body` 时，引擎会自动构造一个**标准化默认载荷**，包含 `contact`（email/subscribed/data）、`workflow`（id/name）、`execution`（id/startedAt）、`event`（触发事件 payload）四大部分。此外，对 `GET` 请求即使配置了 body 也不会发送。
+**代码依据**：[WorkflowExecutionService.ts#L964-L989](file:///d:/fz/0601-1/solo-dogfeeding/code/54-plunk/apps/api/src/services/WorkflowExecutionService.ts#L964-L989)
+
+### ❗ 误判点 22：执行上下文会被后续事件更新
+**误解**：工作流被中途的 WAIT_FOR_EVENT 步骤的事件唤醒后，新事件的数据会更新到 `execution.context` 中，后续步骤可以读取最新值。
+**实际**：`execution.context` 仅在**创建 Execution 时（启动瞬间）一次性写入**，之后永不修改。后续唤醒事件的 data 只写入该 WAIT_FOR_EVENT 步骤的 `stepExecution.output.eventData` 字段，不影响全局 context。
+**代码依据**：[EventService.ts#L470-L477](file:///d:/fz/0601-1/solo-dogfeeding/code/54-plunk/apps/api/src/services/EventService.ts#L470-L477)
+
+### ❗ 误判点 23：超时和事件到达都有同等的防御
+**误解**：WAIT_FOR_EVENT 的两条唤醒路径（超时、事件到达）都有同样的原子性保障。
+**实际**：超时路径有「队列取消 + 二次状态校验」的**双重防御**，而事件到达路径（handleEvent）**没有同等的二次校验**——直接从 DB 读 WAITING 列表就推进，存在并发重复推进的风险（即 6.7 节的原子性问题）。
+**代码依据**：[WorkflowExecutionService.ts#L326-L329](file:///d:/fz/0601-1/solo-dogfeeding/code/54-plunk/apps/api/src/services/WorkflowExecutionService.ts#L326-L329) 对比 [L401-L462](file:///d:/fz/0601-1/solo-dogfeeding/code/54-plunk/apps/api/src/services/WorkflowExecutionService.ts#L401-L462)
+
 ---
 
 ## 八、关键状态流转图
@@ -748,11 +893,13 @@ PENDING → RUNNING ─┬─ 成功 → COMPLETED
 ## 十、总结
 
 ### 主链路
-`Event → Workflow 匹配 → Execution 创建 → 递归执行 Steps → Transitions 路由 → 完成/退出`
+`Event → Workflow 匹配 → Execution 创建（写入 context，之后不变）→ 递归执行 Steps → Transitions 路由 → 完成/退出`
 
 ### 异步边界
 1. **DELAY**：立即完成 Step，通过 BullMQ 延迟调度下一步
 2. **WAIT_FOR_EVENT**：进入 WAITING，双路径唤醒（事件到达 / 超时）
+   - 超时侧：双重防御（队列取消 + 状态二次校验）
+   - 事件侧：缺乏原子性，有并发重复推进风险
 3. **startExecution**： fire-and-forget 模式，不等待执行结果
 
 ### 错误恢复
@@ -760,15 +907,19 @@ PENDING → RUNNING ─┬─ 成功 → COMPLETED
 - 项目禁用自动取消
 - 失败状态持久化 + 通知
 - Webhook SSRF 多层防护（IPv4+IPv6 + 运营商共享段）
+- WAIT_FOR_EVENT 超时侧的双重防御
 
 ### 已知风险与限制
 | 风险点 | 说明 |
 |--------|------|
 | 同步递归长链 | 多步骤同步执行可能超时，遇 DELAY/WAIT_FOR_EVENT 才中断 |
-| 事件唤醒非原子 | handleEvent 无事务，并发可能重复推进 |
+| 事件唤醒非原子 | handleEvent 无事务，并发可能重复推进（不对称：超时侧有防御，事件侧无） |
 | UPDATE_CONTACT 副作用 | 改订阅会触发事件，可能级联启动其他 workflow |
 | SCHEDULE 未实现 | 仅声明枚举，无实际调度逻辑 |
 | DELAY 无时区 | 按毫秒精确计算，不考虑夏令时和自然日 |
+| 变量展开覆盖 | SEND_EMAIL/WEBHOOK 的 variables 浅展开可能被 contact.data 或 context 覆盖系统变量 |
+| 未知操作符硬错误 | CONDITION 配置错误操作符直接抛错，标记 FAILED |
+| 上下文只读 | execution.context 启动后不再更新，新唤醒事件数据仅存 StepExecution.output |
 
 ### 易误判点速查
 | 行为 | 实际表现 |
@@ -780,11 +931,4 @@ PENDING → RUNNING ─┬─ 成功 → COMPLETED
 | notEquals null | 返回 false，不匹配空值 |
 | 删除 Step | 级联删除所有下游 Steps |
 | 活跃时修改 | 仅允许改名称和位置 |
-| FAILED 后 | 不会自动重试，状态为终态 |
-| SCHEDULE 触发 | 仅声明未实现 |
-| WEBHOOK method | 不参与模板渲染 |
-| UPDATE_CONTACT | 改订阅会触发额外事件 |
-| 事件唤醒 | 非原子，并发有重复推进风险 |
-| DELAY days | 精确 24 小时，无时区/夏令时 |
-| TRIGGER/EXIT 入出边 | 无强制校验，EXIT 出边不执行 |
-| exitReason | 不同终态来源不同，部分终态为空 |
+| FAILED 后
