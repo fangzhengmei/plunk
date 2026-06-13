@@ -120,68 +120,129 @@ EventService / MeterService / CampaignService (后置处理)
 | 阶段 | 同步链路 | Worker 链路 |
 |------|---------|------------|
 | **catch 结构** | try-catch 包裹整个发送流程 [L328-L455](file:///d:/fz/0601-1/solo-dogfeeding/code/51-plunk/apps/api/src/services/EmailService.ts#L328-L455) | try-catch 包裹整个发送流程 [L128-L279](file:///d:/fz/0601-1/solo-dogfeeding/code/51-plunk/apps/api/src/jobs/email-processor.ts#L128-L279) |
-| **catch 动作** | ① `signale.error` 日志<br>② `status=FAILED` + 写 `error` 字段<br>③ `throw error` 向上抛出 | ① `signale.error` 日志（带 attemptId）<br>② 取 `attemptsMade + 1 === maxAttempts` 做 `isFinalAttempt` 判断（但**实际未使用**该变量）<br>③ `status=FAILED` + 写 `error` 字段<br>④ `finalizeIfDone` campaign（仅 campaign 邮件）<br>⑤ `throw error` 向上抛出 |
-| **BullMQ 重试** | ❌ 无（同步调用无队列机制） | ✅ 有（队列配置 `attempts: 3` + 指数退避），但因 catch 块已先置 FAILED，**重试会被 PENDING guard 拦截为空转**（详见第五章 5.4） |
+| **catch 动作** | ① `signale.error` 日志<br>② `status=FAILED` + 写 `error` 字段<br>③ `throw error` 向上抛出 | ① `signale.error` 日志（带 attemptId）<br>② 取 `attemptsMade + 1 === maxAttempts` 做 `isFinalAttempt` 判断（但**实际未使用**该变量，死代码）<br>③ `status=FAILED` + 写 `error` 字段<br>④ **无** finalizeIfDone（catch 内缺此调用，详见 5.1 — 这是 campaign 卡 SENDING 的根因）<br>⑤ `throw error` 向上抛出 |
+| **BullMQ 重试** | ❌ 无（同步调用无队列机制） | ✅ 有（队列配置 `attempts: 3` + 指数退避），但因 catch 块已先置 FAILED + 入口 status 早返，**重试空转且第 3 次永远不触发**（详见 5.2） |
 | **未订阅处理** | 不抛异常，return 静默结束（不触发任何重试/补偿） | ❌ 无此场景（不做检查） |
 | **项目禁用处理** | ❌ 不检查 | 不抛异常，return 静默结束 + finalize campaign |
 | **钓鱼检测处理** | ❌ 不检查 | `phishingResult.shouldDisable` 时先禁用项目 + 取消所有作业，再抛异常触发 FAILED 写入 |
 
 ---
 
-### 5.1 Campaign finalizeIfDone 分支完整性分析 — 风控命中与异常分支缺失导致 Campaign 卡在 SENDING
+### 5.1 Campaign finalizeIfDone 分支完整性分析 — 仅外层 catch（SES/Prisma 异常）是真实卡住通路，phishing 命中有副作用链兜底收敛
 
-Worker 链路中 `CampaignService.finalizeIfDone`（[CampaignService.ts#L541-L587](file:///d:/fz/0601-1/solo-dogfeeding/code/51-plunk/apps/api/src/services/CampaignService.ts#L541-L587)）的终止条件是 `processedCount >= totalRecipients`。其中 `processedCount` 定义为 DB 中 `status IN (SENT, FAILED)` 的邮件总数。理论上只要所有邮件都落到了 SENT 或 FAILED 终态，Campaign 就应自动从 SENDING → SENT。但 `finalizeIfDone` 的调用路径不完整，存在两条分支**已写 FAILED 却没调收敛函数**，导致 processedCount 在 DB 中虽已达标但 finalize 永远不触发：
+Worker 链路中 `CampaignService.finalizeIfDone`（[CampaignService.ts#L541-L587](file:///d:/fz/0601-1/solo-dogfeeding/code/51-plunk/apps/api/src/services/CampaignService.ts#L541-L587)）的终止条件是 `processedCount >= totalRecipients`。
 
-#### 5 条退出路径的 finalize 覆盖情况
+#### processedCount 的精确定义（对照代码）
 
-| # | 退出路径 | 代码位置 | status 终态 | 是否调用 finalizeIfDone | 缺失后果 |
-|---|---------|---------|:----------:|:---------------------:|---------|
-| 1 | **项目禁用早返**（try 外） | [email-processor.ts#L104-L119](file:///d:/fz/0601-1/solo-dogfeeding/code/51-plunk/apps/api/src/jobs/email-processor.ts#L104-L119) | FAILED | ✅ 有（[L116-L118](file:///d:/fz/0601-1/solo-dogfeeding/code/51-plunk/apps/api/src/jobs/email-processor.ts#L116-L118)） | — |
-| 2 | **status ≠ PENDING 早返** | [email-processor.ts#L99-L101](file:///d:/fz/0601-1/solo-dogfeeding/code/51-plunk/apps/api/src/jobs/email-processor.ts#L99-L101) | 不修改 | ❌ 无 | 无后果（终态已在之前触发过 finalize） |
-| 3 | **⚠️ 风控/phishing 命中 throw**（try 内） | [email-processor.ts#L193-L211](file:///d:/fz/0601-1/solo-dogfeeding/code/51-plunk/apps/api/src/jobs/email-processor.ts#L193-L211) | FAILED | ❌ **无** | `prisma.email.update` 写 FAILED → throw Error 跳出，但 `campaignId` 分支无任何收敛调用。processedCount 增加了，Campaign 却永远等不到 finalize |
-| 4 | **SES 调用成功** | [email-processor.ts#L263-L265](file:///d:/fz/0601-1/solo-dogfeeding/code/51-plunk/apps/api/src/jobs/email-processor.ts#L263-L265) | SENT | ✅ 有 | — |
-| 5 | **⚠️ 外层 catch 分支**（try 外） | [email-processor.ts#L266-L278](file:///d:/fz/0601-1/solo-dogfeeding/code/51-plunk/apps/api/src/jobs/email-processor.ts#L266-L278) | FAILED | ❌ **无** | 以下异常都算在此分支：<br>① SES 网络/配额错误 (sendRawEmail throw)<br>② Prisma 连接中断 / SQL 错误<br>③ 模板格式化/编译内部抛错<br>④ SecurityService.checkPhishingContent 网络超时<br>⑤ OpenRouter LLM 调用失败<br>这些场景同样：DB 写 FAILED，processedCount +1，但 finalize 不触发 |
+[CampaignService.ts#L558-L566](file:///d:/fz/0601-1/solo-dogfeeding/code/51-plunk/apps/api/src/services/CampaignService.ts#L558-L566) 的实际 SQL WHERE 条件是 **OR**，而不是 `IN (SENT, FAILED)`：
 
-#### 具体卡住场景（风控拦截路径）
+```ts
+prisma.email.count({
+  where: {
+    campaignId,
+    OR: [{sentAt: {not: null}}, {status: EmailStatus.FAILED}],
+  },
+});
+```
+
+即：
+- **分支 1**：`sentAt NOT NULL` — 覆盖所有真正调用过 SES 并拿到 messageId 的邮件（通常 status 也会是 SENT，但判断条件以 sentAt 字段为准，而不是 status 字段）
+- **分支 2**：`status = FAILED` — 覆盖所有被 catch 块、禁用处理、钓鱼检测写为 FAILED 的邮件
+
+> **细微差别**：理论上存在 `status = SENT 但 sentAt = NULL` 或 `sentAt 有值 但 status != SENT` 的不一致状态（Bug 场景）。processedCount 不会把 status=SENT 但 sentAt 为空的邮件算入，这点要注意。
+
+#### 5 条退出路径的 finalize 覆盖情况（对照代码逐行核对）
+
+| # | 退出路径 | 代码位置 | status 终态 / sentAt | 本分支是否调用 finalizeIfDone | 有无外部兜底收敛 | 实际是否会卡 SENDING |
+|---|---------|---------|:-------------------:|:---------------------:|:-------------:|:----------------:|
+| 1 | **项目禁用早返**（try 外） | [email-processor.ts#L104-L119](file:///d:/fz/0601-1/solo-dogfeeding/code/51-plunk/apps/api/src/jobs/email-processor.ts#L104-L119) | FAILED / NULL | ✅ 有（[L116-L118](file:///d:/fz/0601-1/solo-dogfeeding/code/51-plunk/apps/api/src/jobs/email-processor.ts#L116-L118)） | — | ❌ 不会 |
+| 2 | **status ≠ PENDING 早返** | [email-processor.ts#L99-L101](file:///d:/fz/0601-1/solo-dogfeeding/code/51-plunk/apps/api/src/jobs/email-processor.ts#L99-L101) | 不修改 / 不变 | ❌ 无 | — | ❌ 不会（终态邮件之前已触发过 finalize，或这次是重试空转） |
+| 3 | **风控/phishing 命中 throw**（try 内） | [email-processor.ts#L193-L211](file:///d:/fz/0601-1/solo-dogfeeding/code/51-plunk/apps/api/src/jobs/email-processor.ts#L193-L211) | FAILED / NULL | ❌ 本分支无 | ✅ **disableProjectForPhishing → cancelAllProjectJobs 兜底** | ⚠️ **happy path 不卡，副作用链异常时才卡** |
+| 4 | **SES 调用成功** | [email-processor.ts#L263-L265](file:///d:/fz/0601-1/solo-dogfeeding/code/51-plunk/apps/api/src/jobs/email-processor.ts#L263-L265) | SENT / NOT NULL | ✅ 有 | — | ❌ 不会 |
+| 5 | **⚠️ 外层 catch 分支**（try 外） | [email-processor.ts#L266-L278](file:///d:/fz/0601-1/solo-dogfeeding/code/51-plunk/apps/api/src/jobs/email-processor.ts#L266-L278) | FAILED / NULL | ❌ **无** | ❌ 无任何兜底 | ⚠️ ✅ **唯一真实卡住通路** |
+
+---
+
+#### 路径 3 详解：phishing 命中 — happy path 不卡，有 `disableProjectForPhishing → cancelAllProjectJobs → finalizeIfDone` 兜底收敛
+
+`email-processor.ts` phishing 命中分支本身虽然不调 finalizeIfDone，但它在 throw 之前调用了 `SecurityService.disableProjectForPhishing`，而后者内部有完整的副作用链做兜底：
+
+```
+[L195]  SecurityService.disableProjectForPhishing(projectId, ...)    ← phishing 命中分支第 1 个调用
+  │
+  ├─ [SecurityService.ts#L970-L973]  prisma.project.update({disabled: true})
+  │
+  ├─ [SecurityService.ts#L984-L989]  QueueService.cancelAllProjectJobs(projectId)
+  │     │
+  │     ├─ [QueueService.ts#L549-L604]  遍历 scheduledQueue / emailQueue / campaignQueue / workflowQueue
+  │     │     逐个校验归属项目后 job.remove()
+  │     │
+  │     ├─ [QueueService.ts#L609-L612]  prisma.email.updateMany({
+  │     │                                where: {projectId, status: PENDING},
+  │     │                                data: {status: FAILED, error: 'Project is disabled'}
+  │     │                              })
+  │     │                               ← 把项目所有仍在 PENDING 的邮件刷为 FAILED
+  │     │                               ← processedCount（sentAt NOT NULL OR status=FAILED）随之 +N
+  │     │
+  │     └─ [QueueService.ts#L622-L636]  查所有 status=SENDING 的 Campaign →
+  │                                        ① 修正 totalRecipients = 实际 email 行数
+  │                                        ② 调用 CampaignService.finalizeIfDone(campaign.id)
+  │                                          ← 此时 processedCount 因 updateMany 已经>=totalRecipients
+  │                                          ← Campaign 从 SENDING → SENT
+  │
+  └─ 发 Ntfy + 邮件通知项目成员
+
+[L203-L209]  prisma.email.update({status: FAILED})    ← 写当前这一封的 FAILED
+[L211]      throw Error(...)                          ← throw 跳出 try
+```
+
+**结论（phishing 命中分支）**：
+- **happy path（`cancelAllProjectJobs` 及其内部 `updateMany` + `finalizeIfDone` 全部成功）→ Campaign **不会**卡 SENDING**。cancelAllProjectJobs 在 [QueueService.ts#L635](file:///d:/fz/0601-1/solo-dogfeeding/code/51-plunk/apps/api/src/services/QueueService.ts#L635) 会遍历所有 SENDING Campaign 并逐一 finalize。
+- **异常 edge case（`cancelAllProjectJobs` 在 updateMany 之后、finalizeIfDone 之前抛异常，或 Redis/BullMQ 抖动导致遍历中途中断）→ Campaign **才会**卡 SENDING**。由于 disableProjectForPhishing 对 `cancelAllProjectJobs` 的调用包在独立 try/catch 中（[SecurityService.ts#L984-L989](file:///d:/fz/0601-1/solo-dogfeeding/code/51-plunk/apps/api/src/services/SecurityService.ts#L984-L989)），catch 后只打日志不重抛，所以如果 cancelAllProjectJobs 失败，项目会被禁用但 Campaign 留在 SENDING。
+
+---
+
+#### 路径 5 详解：外层 catch（SES / Prisma / 模板编译等异常）— **唯一真实卡住通路，无任何兜底**
+
+这条分支没有任何外部收敛兜底。所有落入 catch 的异常都算在此路径：
+
+1. `sendRawEmail` 抛出的 SES 异常：`Throttling`、`MessageRejected`、`LimitExceeded`、网络超时、AWS 凭证失效等
+2. Prisma 异常：DB 连接中断、SQL 错误、事务冲突（注意：[L124-L127](file:///d:/fz/0601-1/solo-dogfeeding/code/51-plunk/apps/api/src/jobs/email-processor.ts#L124-L127) 的 `PENDING→SENDING`、[L232-L239](file:///d:/fz/0601-1/solo-dogfeeding/code/51-plunk/apps/api/src/jobs/email-processor.ts#L232-L239) 的 `SENDING→SENT` 都走 Prisma，任一失败都会进 catch）
+3. 模板编译链异常：`EmailService.format` / `EmailService.compile` 的内部抛错
+4. 钓鱼检测本身异常：`SecurityService.checkPhishingContent` 请求 OpenRouter 超时（如果不是返回 safeResponse 默认而是 throw 的场景）
+5. 计费上报异常：`MeterService.recordEmailSent` 内部抛错（虽然它也走异步队列，但 Stripe SDK 初始化阶段出错会同步 throw）
+
+具体卡住场景（SES 异常）：
 
 ```
 Campaign totalRecipients = 1000
   ↓
-其中第 327 封邮件 checkPhishingContent() 返回 shouldDisable = true
+990 封 SES 成功 → 每次进入 [L263-L265] 调 finalizeIfDone
+                  每次 processedCount = 990 < 1000，finalize return 不收敛
   ↓
-[L203-L209] prisma.email.update({status: FAILED})  ← processedCount DB 中 +1
-[L211] throw Error("Project has been disabled...")
+剩下 10 封 sendRawEmail() 抛 AWS SES 异常（例如 Throttling / MessageRejected）
   ↓
-throw 跳出 try 块，不执行 try 末尾的 [L263-L265] finalizeIfDone
+全部进入 catch 块 [email-processor.ts#L266-L278]：
+  [L270-L275]  prisma.email.update({status: FAILED})
+                 → DB 中 processedCount (sentAt NOT NULL OR status=FAILED) = 990 + 10 = 1000
+  [L278]       throw error
+                 → 跳过 try 末尾的 [L263-L265] finalizeIfDone，且没有任何其他地方触发收敛
   ↓
-最终 processedCount = 1000（因为 SecurityService.disableProjectForPhishing
-   会调 cancelAllProjectJobs，它里面会批量 updateMany 把所有 PENDING → FAILED）
-但 finalizeIfDone 从未被触发 → Campaign 永远停在 status=SENDING
+最终 DB 中 processedCount = 1000 >= totalRecipients = 1000
+但 finalizeIfDone 从未以 processedCount = 1000 的状态被调用过
+  ↓
+Campaign 永远留在 status=SENDING，前端持续显示"发送中"，无告警
 ```
 
-> **补充说明**：虽然 `cancelAllProjectJobs` 在批量把 PENDING → FAILED 之后确实**有**一段 finalizeIfDone 逻辑（见 [QueueService.ts#L636-L640](file:///d:/fz/0601-1/solo-dogfeeding/code/51-plunk/apps/api/src/services/QueueService.ts#L636-L640)），但它遍历的是"当前还处于 SENDING 状态的 Campaigns"，而 [L211] throw 时第 327 封的 Email 只是单封被写入 FAILED，Campaign 本身仍处于 SENDING，所以**只有在 cancelAllProjectJobs 的批处理跑完后才会收敛**——但 phishing 分支**那一封**触发 throw 的邮件自身没有调 finalize。若项目禁用的批处理过程中出现异常（例如 Redis 连接抖动），Campaign 就永久卡住。
+> **为什么没有兜底**：这条路径不会触发 `disableProjectForPhishing`（只有 shouldDisable=true 时才调），也没有类似 phishing 的外部副作用链帮忙扫尾。它只是单封邮件独立失败，其他邮件可能还在正常出队，Campaign 看起来"还在发送"——但最后一封异常失败后，就再也没人触发 finalize。
 
-#### 具体卡住场景（SES 异常路径）
-
-```
-Campaign totalRecipients = 1000
-  ↓
-成功发送 990 封 → finalize 触发 990 次，每次 processedCount = 990 < 1000，return
-  ↓
-剩下 10 封的 sendRawEmail() 因 AWS SES 出现 Throttling / MessageRejected 等异常
-  ↓
-每封都走到 catch 块：[L270-L275] prisma.email.update({status: FAILED})
-                    [L278] throw error
-  ↓
-最终 DB 中 processedCount = 990 + 10 = 1000 >= 1000
-但 finalizeIfDone 从来没以 processedCount = 1000 的状态被调用过
-  ↓
-Campaign 永远卡在 SENDING，前端一直显示"发送中"，无任何告警
-```
+---
 
 #### 修复方向
 
-在 phishing 命中分支 ([L203-L211] 之间) 与外层 catch 分支 ([L266-L278] 之间)，当 `email.campaignId != null` 时补充调用 `CampaignService.finalizeIfDone(email.campaignId)`。`status !== PENDING` 那条早返分支可不调，因为终态邮件通常之前已经触发过收敛。
+只需要在外层 catch 分支 ([email-processor.ts#L266-L278](file:///d:/fz/0601-1/solo-dogfeeding/code/51-plunk/apps/api/src/jobs/email-processor.ts#L266-L278) 写完 FAILED 之后)，当 `email.campaignId != null` 时补充调用 `CampaignService.finalizeIfDone(email.campaignId)`。
+
+phishing 命中分支本身可不改——happy path 下 `disableProjectForPhishing → cancelAllProjectJobs → finalizeIfDone` 已经兜底收敛；若希望在 `cancelAllProjectJobs` 异常时也做二级保障，可以在 phishing 分支 throw 之前加一次局部 finalize 调用。
 
 ---
 
@@ -299,11 +360,12 @@ Worker 没有"调用 `EmailService.sendEmail()`"（与注释矛盾），也没�
 | 项目禁用状态检查 (`project.disabled`) | ❌ | ✅ |
 | LLM 钓鱼内容检测 (`checkPhishingContent`) + 采样率 | ❌ | ✅ |
 | Stripe 计费 MeterEvent 上报（含附件加权） | ❌ | ✅ |
-| Campaign finalize 状态收敛 | ❌ | ✅ |
-| 收件人姓名注入 `to.name` | ❌ | ✅ |
-| `project.replyTo` 作为 replyTo 回退值 | ❌ | ✅ |
+| Campaign finalize 状态收敛（仅成功路径 + 禁用路径） | ❌ | ✅（不完整，详见 5.1） |
+| 收件人姓名注入 `to.name`（来源 `email.toName` 字段） | ❌ | ✅ |
 | 项目禁用级联清理 (`cancelAllProjectJobs`) | ❌ | ✅ |
+| `isFinalAttempt` 重试状态计算（死代码，未使用） | ❌ | ✅ |
 | `X-Plunk-Recipient-Override` header 处理 | ✅ (公共 header 处理一致) | ✅ (公共 header 处理一致) |
+| replyTo 处理（`email.replyTo \|\| undefined`） | ✅ | ✅（两边完全一致，无 project.replyTo 回退） |
 
 ---
 
@@ -314,21 +376,34 @@ Worker 没有"调用 `EmailService.sendEmail()`"（与注释矛盾），也没�
 ```
 阶段 1 (MVP):
   EmailService.sendEmail ← 同步直发，所有逻辑都在这里
-  包含：域名校验 + 订阅校验 + 模板处理 + 状态更新 + SES 调用
+  包含：域名校验 + 订阅校验 + 三个模板静态方法调用 + 状态机 + SES 参数构造 + SES 调用
 
 阶段 2 (规模化):
   引入 BullMQ → 抽取 Email + QueueService
-  Worker 内联重写了状态更新、外部检查、业务逻辑部分（email-processor.ts）
-    新增：项目禁用检查 / 钓鱼检测 / 计费 / campaign 联动 / 速率控制
-    但遗漏了同步链路原有的：域名校验 / 订阅二次校验 ← 技术债
-  模板处理部分（format / compile / shouldTrackEmail）保持共享调用 EmailService 静态方法，未重复实现
+  Worker 在 email-processor.ts 中重写了：
+    ① 状态机（新增：项目禁用检查/钓鱼检测/计费上报/finalize）
+    ② sendRawEmail 参数构造（新增：to.name 注入 / 附件加权 / recipient 二选一结构）
+    【技术债】遗漏同步链路原有的：域名校验 + 订阅二次校验
+  Worker 保留共享，未重写：
+    ③ 三个无副作用纯函数 → 直接调 EmailService.format / compile / shouldTrackEmail 静态方法
 
 现状:
-  同步链路 → 测试专用 / 历史遗留 / 文档上说是 Worker 调它但实际 Worker 没调 sendEmail()
-  Worker 链路 → 真正的生产路径，部分逻辑共享 EmailService 静态方法
+  同步链路 → 测试专用 / 历史遗留 / 注释写着 Worker 调它但实际没有
+  Worker 链路 → 真正的生产路径："状态机 + 参数构造"被复制，模板纯函数被共享
 ```
 
-> **证据**：`EmailService.sendEmail` 的注释写着 "This is called by the email processor worker"，但 [email-processor.ts](file:///d:/fz/0601-1/solo-dogfeeding/code/51-plunk/apps/api/src/jobs/email-processor.ts) 全程没有调用 `EmailService.sendEmail()`，而是**部分内联重写 + 部分共享调用**：内联重写了状态更新和外部检查逻辑（`PENDING→SENDING→SENT/FAILED` 流程、钓鱼检测、禁用检查、计费上报），但模板格式化（`EmailService.format` [L131](file:///d:/fz/0601-1/solo-dogfeeding/code/51-plunk/apps/api/src/jobs/email-processor.ts#L131)）、HTML 编译（`EmailService.compile` [L146](file:///d:/fz/0601-1/solo-dogfeeding/code/51-plunk/apps/api/src/jobs/email-processor.ts#L146)）仍直接调用 EmailService 静态方法。注释与实现不一致，说明中间重构时 Worker 从"调用 sendEmail()"改成了"内联拆分"，但同步方法没被删除、注释没更新，形成了当前"两条并行链路 + 部分共享"的状态。
+> **证据**：`EmailService.sendEmail` 的注释写着 "This is called by the email processor worker"，但 [email-processor.ts](file:///d:/fz/0601-1/solo-dogfeeding/code/51-plunk/apps/api/src/jobs/email-processor.ts) 全程没有调用 `EmailService.sendEmail()`，实际架构是**「两个被复制的有副作用模块」+「三个被共享的无副作用静态方法」**：
+>
+> 被复制（各自内联，存在差异）：
+> - 状态机流转：同步链路 [EmailService.ts#L309-L452](file:///d:/fz/0601-1/solo-dogfeeding/code/51-plunk/apps/api/src/services/EmailService.ts#L309-L452) vs Worker [email-processor.ts#L104-L276](file:///d:/fz/0601-1/solo-dogfeeding/code/51-plunk/apps/api/src/jobs/email-processor.ts#L104-L276)
+> - SES 参数构造：同步链路 [EmailService.ts#L370-L419](file:///d:/fz/0601-1/solo-dogfeeding/code/51-plunk/apps/api/src/services/EmailService.ts#L370-L419) vs Worker [email-processor.ts#L156-L229](file:///d:/fz/0601-1/solo-dogfeeding/code/51-plunk/apps/api/src/jobs/email-processor.ts#L156-L229)
+>
+> 被共享（两边同一份实现，零差异）：
+> - 变量替换：`EmailService.format`（Worker [L131](file:///d:/fz/0601-1/solo-dogfeeding/code/51-plunk/apps/api/src/jobs/email-processor.ts#L131) / 同步 [L344](file:///d:/fz/0601-1/solo-dogfeeding/code/51-plunk/apps/api/src/services/EmailService.ts#L344)）
+> - HTML 编译：`EmailService.compile`（Worker [L146](file:///d:/fz/0601-1/solo-dogfeeding/code/51-plunk/apps/api/src/jobs/email-processor.ts#L146) / 同步 [L360](file:///d:/fz/0601-1/solo-dogfeeding/code/51-plunk/apps/api/src/services/EmailService.ts#L360)）
+> - 追踪决策：`EmailService.shouldTrackEmail`（Worker [L182](file:///d:/fz/0601-1/solo-dogfeeding/code/51-plunk/apps/api/src/jobs/email-processor.ts#L182) / 同步 [L402](file:///d:/fz/0601-1/solo-dogfeeding/code/51-plunk/apps/api/src/services/EmailService.ts#L402)）
+>
+> 注释与实现不一致，说明中间重构时 Worker 从"整体调用 sendEmail()"改成了"部分共享、部分复制"，但同步方法没被删除、注释没更新，形成了当前的混合架构状态。
 
 ---
 
