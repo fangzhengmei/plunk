@@ -639,3 +639,345 @@ number/bool/null → 原样返回（不做模板化，保证类型不变）
 ```
 
 特别地，`method` 字段 **完全不走任何渲染**（L926 解析后直接透传到 safeFetch）。这是防止 `{{malicious}}` 模板被扩展成非预期 HTTP 动词的安全决策，在 WEBHOOK 的设计注释 L913-L918 中明确标出。
+
+---
+
+## 十二、进程中断后的恢复路径
+
+### 两个"主进程"的启动行为
+
+Plunk 至少存在两个独立的 Node.js 进程，它们在启动时都**不会扫描数据库重新入队孤儿任务**，而是各自依赖 BullMQ 基于 Redis 的底层重试 / stalled 检测机制做有限恢复：
+
+| 进程入口 | 启动方式 | 启动时是否扫 DB 孤儿 | 其他启动动作 |
+|---------|---------|---------------------|------------|
+| API 主进程 [app.ts](file:///d:/fz/0601-1/solo-dogfeeding/code/57-plunk/apps/api/src/app.ts#L400-L459) | `node dist/app.js` | ❌ 不扫 workflow / stepExecutions | prisma.connect → 启动 HTTP → 打印特征矩阵 → S3 建桶 → 注册若干 RepeatableJob（域名检测 / 数据清理等） |
+| Worker 进程 [worker.ts](file:///d:/fz/0601-1/solo-dogfeeding/code/57-plunk/apps/api/src/jobs/worker.ts#L25-L124) | `node dist/jobs/worker.js` | ❌ 不扫 DB | 依次 createXxxWorker() 创建 10 个 Worker 实例；SIGINT/SIGTERM/异常统一 stopWorkers() 优雅退出 |
+
+### 孤儿状态的分类与恢复能力
+
+当进程在步骤执行过程中被 kill -9 / 宿主机断电 / OOM kill 后，系统里可能存在以下 5 种"卡在途中"的状态，其恢复路径完全不同：
+
+```
+                  进程崩溃发生在...
+                       │
+       ┌───────────────┼───────────────────┐
+       ▼               ▼                   ▼
+   ┌─────────┐   ┌───────────┐      ┌──────────────┐
+   │BullMQ里 │   │DB状态是   │      │DB状态是      │
+   │Job已取  │   │RUNNING /  │      │WAITING且     │
+   │出但未   │   │WAITING但  │      │BullMQ对应Job │
+   │ack      │   │BullMQ Job│      │已被删除或    │
+   │(LOCKED) │   │已被消费  │      │不在delayed   │
+   └────┬────┘   └────┬──────┘      └──────┬───────┘
+        │             │                    │
+        ▼             ▼                    ▼
+   BullMQ         DB级扫描             无自动恢复
+   stalled        (不存在)            (需要运维脚本)
+   检测兜底
+```
+
+#### 类型 1：BullMQ stall 检测（有恢复）
+BullMQ 默认每 30s 做一次 stall 检测（`stalledInterval`，Worker 未自定义），lockDuration 默认 30s。Worker 拿了 Job 后如果崩溃：
+- Job 保持 `active` 状态并持有 Redis 锁
+- 30s 后没有 lockRenew → 被 BullMQ 标记为 stalled
+- stall 检测线程将其放回 waiting 队列（或自动重试），由其他活着的 Worker 再次认领
+- 该 Job 的 attempts 会计一次（若 attempts 已用尽，最终进入 failed）
+
+覆盖的场景：DELAY 步骤的 queueWorkflowStep Job、WAIT_FOR_EVENT 的 timeout Job、所有正常的 process-step 任务。
+
+#### 类型 2：DB 中 workflowExecution.status = WAITING 且 stepExecution.status = WAITING 但 timeout 的 BullMQ Job 被误删（无自动恢复）
+这种情况只能靠 handleEvent 里的事件到来自救。如果事件永远不来，就会成为"永久 WAITING 的僵尸执行"。当前代码里没有按 `(status=WAITING, executeAfter < now())` 扫 DB 重入队的 cron。
+
+#### 类型 3：processStepExecution 卡在"取了 stepExecution → executeStep 中 → 还没 update COMPLETED"的中间态（无 DB 级恢复，靠 BullMQ 重试）
+代码上 [L176-L208](file:///d:/fz/0601-1/solo-dogfeeding/code/57-plunk/apps/api/src/services/WorkflowExecutionService.ts#L176-L208) 的模式是 `findFirst(PENDING/RUNNING) ? update : create`，崩溃后再被 BullMQ stall 机制重新捞起时：
+- 如果上次已经写到 RUNNING，会直接在 L201 `update({status: RUNNING})` 覆盖同一条继续执行（非幂等，有副作用的步骤如 SEND_EMAIL 可能重复）
+- 如果上次还没 create，就创建新的 stepExecution 行（会产生同一 execution 同一步骤的多行记录，见下文 DB 约束问题）
+
+#### 类型 4：startWorkflowForContact 在"创建 execution → 还没调 processStepExecution"之间崩溃
+新 execution 会永远停在 RUNNING + currentStepId=TRIGGER，但没有对应的 BullMQ Job（没入队）。此时除非有事件再触发或外部重试，否则无人推进。
+
+#### 类型 5：事件已经到达并 handleEvent 中 update(COMPLETED) 之后、cancelWorkflowTimeout 之前崩溃
+此时 DB 状态正确，只是 BullMQ 里的 timeout Job 没被撤销。timeout Job 到点时，processTimeout 的 L327 `status !== WAITING` 检查能安全兜底，不重复推进——**这条路径是幂等安全的**。
+
+---
+
+## 十三、BullMQ 检测与多 Worker 任务协同
+
+### Worker 配置全貌
+
+**workflowQueue（Queue 端）**：[QueueService.ts L73-L84](file:///d:/fz/0601-1/solo-dogfeeding/code/57-plunk/apps/api/src/services/QueueService.ts#L73-L84)
+```
+{
+  connection: ioredis (maxRetriesPerRequest=null, enableReadyCheck=false),
+  defaultJobOptions: {
+    attempts: 3,                           // 3次重试 + 初始1次 = 最多4次
+    backoff: {type:'exponential', delay:2000},  // 2s, 4s, 8s
+    removeOnComplete: 1000,               // Redis 内存上限保护
+    removeOnFail: 5000,
+  }
+}
+```
+
+**workflowWorker（Worker 端）**：[workflow-processor-queue.ts L13-L35](file:///d:/fz/0601-1/solo-dogfeeding/code/57-plunk/apps/api/src/jobs/workflow-processor-queue.ts#L13-L35)
+```
+{
+  connection: 同一个 ioredis,
+  concurrency: 10,   // ★ 单进程内并发10条
+  autorun: true,
+}
+```
+
+### 多副本（多进程/多主机）的协同机制
+
+BullMQ 是 Redis Stream + Lua Script 实现的分布式队列，**多 Worker 副本会自动竞争认领 Job**（靠 Redis 的原子 `XREADGROUP`）：
+
+```
+   ┌─ Worker副本A (concurrency=10) ─┐
+   │  认领 Job1 → processTimeout    │
+   │  认领 Job3 → processStepExec   │
+   └────────────────────────────────┘
+                │     ▲
+                │     │ Redis Stream
+                ▼     │ (XADD/XREADGROUP/XACK)
+   ┌──────── Redis ──────────────────┐
+   │  workflow (Queue名)             │
+   │  活跃job的锁 = jobId 下的 ZSET  │
+   └─────────────────────────────────┘
+                      │
+                      ▼
+   ┌─ Worker副本B (concurrency=10) ─┐
+   │  认领 Job2 → processStepExec   │
+   │  认领 Job4 → (stalled后重抢)   │
+   └────────────────────────────────┘
+```
+
+**协同的三重"正确性基础"**：
+
+1. **Redis 级全局锁**：BullMQ 在 `active` 状态的 Job 上持有一把基于 `lockDuration`（默认 30s）的锁，定时 `lockRenewTime`（默认 15s）续期。副本 A 崩了不续期 → 副本 B 在 stall 检测后按规则重新认领。
+2. **确定性 jobId 做幂等屏障**：QueueService 所有 add 操作都显式指定 jobId：
+   - `queueWorkflowStep` → `workflow-${executionId}-${stepId}`（[QueueService L240](file:///d:/fz/0601-1/solo-dogfeeding/code/57-plunk/apps/api/src/services/QueueService.ts#L240)）
+   - `queueWorkflowTimeout` → `workflow-timeout-${stepExecutionId}`（[L259](file:///d:/fz/0601-1/solo-dogfeeding/code/57-plunk/apps/api/src/services/QueueService.ts#L259)）
+   
+   这意味着"同一 (executionId, stepId) 的延迟步骤"或"同一步骤执行的超时"**不可能被重复 add 两次**——BullMQ 对同 id 的 Job 会报错。
+3. **stalled 检测兜底**：跨副本的僵尸 Job 最终会被清理。
+
+**尚未自定义的关键参数（使用 BullMQ 默认值）**：
+
+| 参数 | BullMQ 默认值 | 对 workflow 的影响 |
+|------|--------------|------------------|
+| `lockDuration` | 30,000 ms | 单个 step 执行超过 30s 未续锁 → 被认为 stall |
+| `lockRenewTime` | 15,000 ms | 每 15s 给 running Job 续期一次 |
+| `stalledInterval` | 30,000 ms | 每 30s 扫一次 stalled Job |
+| `maxStalledCount` | 1 | stalled 超过 1 次后 job 进 failed |
+
+对 WEBHOOK 步骤的影响：`safeFetch` 超时是 10s + 5 跳重定向（每跳 10s 上限），因此单 WEBHOOK 最差场景约 1 分钟。但 BullMQ lockRenewTime 每 15s 会自动续，所以不会被误判 stalled——只要 Worker 进程还活着。
+
+---
+
+## 十四、transition 级表达式的占位钩子问题
+
+### 当前的"条件匹配"只有 2 种有效形式
+
+回顾 [processNextSteps L1113-L1141](file:///d:/fz/0601-1/solo-dogfeeding/code/57-plunk/apps/api/src/services/WorkflowExecutionService.ts#L1113-L1141) 的选择逻辑：
+
+```
+for transition in outgoingTransitions（按priority升序）:
+  1. transition.condition 为 null / undefined   → 选中（无条件通行）
+  2. transition.condition.branch === stepResult.branch   → 选中（CONDITION步骤分支匹配）
+  3. this.evaluateTransitionCondition(condition, stepResult, execution)
+     → 目前函数体只有"return false"，永远不命中
+```
+
+**未启用的 evaluateTransitionCondition** 源码见 [L1268-L1276](file:///d:/fz/0601-1/solo-dogfeeding/code/57-plunk/apps/api/src/services/WorkflowExecutionService.ts#L1268-L1276)：
+
+```typescript
+private static evaluateTransitionCondition(
+  _condition: Prisma.JsonValue,
+  _stepResult: StepResult,
+  _execution: WorkflowExecutionWithRelations,
+): boolean {
+  // Implement custom transition condition logic here
+  // For now, return false as default
+  return false;
+}
+```
+
+### 数据模型与 Schema 已为未来扩展留口
+
+- DB 模型 [WorkflowTransition.condition](file:///d:/fz/0601-1/solo-dogfeeding/code/57-plunk/packages/db/prisma/schema.prisma#L422)：`condition Json?`（没有 schema 约束，任意 JSON 都能存）
+- Zod Schema [createTransition](file:///d:/fz/0601-1/solo-dogfeeding/code/57-plunk/packages/shared/src/schemas/index.ts#L238-L243)：`condition: jsonSchema.optional()`（同样接受任意 JSON）
+- DB 里已有的 `priority` 字段 + `orderBy: {priority: 'asc'}` 为复杂表达式"优先级短路求值"打好基础
+
+### 未来扩展的 3 个陷阱点（代码未实现，但架构上要注意）
+
+| 陷阱 | 风险说明 | 关联代码 |
+|------|---------|---------|
+| **processTimeout 不经过 processNextSteps** | 如果将来 evaluateTransitionCondition 能评估表达式，那么 WAIT_FOR_EVENT 超时路径的内联推进 [L350-L395](file:///d:/fz/0601-1/solo-dogfeeding/code/57-plunk/apps/api/src/services/WorkflowExecutionService.ts#L350-L395) 仍只认 timeout/fallback，不会走新扩展。扩展后要记得同步。 | processTimeout 内联推进 |
+| **condition.branch 与表达式同时存在的优先级** | 当前 L1124 先判断 branch 精确匹配，L1137 才调 evaluateTransitionCondition。如果未来在 transition 上既写 `{branch: "yes", and: [{...}]}`，需要明确"AND 还是 OR"。 | processNextSteps L1124 vs L1137 |
+| **CONDITION step.condition 与 transition.condition 的职责混淆** | 目前条件求值在 CONDITION 步骤内 executeCondition 做，transition 只拿 branch 字符串做跳转。如果扩展 transition.condition 的表达式能力，需要明确"CONDITION 做字段解析还是 transition 做"——两者都做会导致双份逻辑双份 bug。 | executeCondition vs 未来 evaluateTransitionCondition |
+
+---
+
+## 十五、多副本 Worker 下的乐观锁与唯一约束现状
+
+### 关键发现：数据库层缺少 (executionId, stepId) 的唯一约束
+
+**WorkflowStepExecution 当前索引**（[schema.prisma L475-L510](file:///d:/fz/0601-1/solo-dogfeeding/code/57-plunk/packages/db/prisma/schema.prisma#L475-L510)）：
+
+```prisma
+@@index([executionId, status])
+@@index([stepId])
+@@index([status, scheduledFor])
+@@index([scheduledFor])
+// ★ 注意：没有 @@unique([executionId, stepId])
+```
+
+### processStepExecution 的"隐式幂等"模式
+
+对应的代码 [L176-L208](file:///d:/fz/0601-1/solo-dogfeeding/code/57-plunk/apps/api/src/services/WorkflowExecutionService.ts#L176-L208)：
+
+```typescript
+let stepExecution = await prisma.workflowStepExecution.findFirst({
+  where: {
+    executionId,
+    stepId,
+    status: {in: [StepExecutionStatus.PENDING, StepExecutionStatus.RUNNING]},
+    // ★ 不是唯一查询，只找 PENDING/RUNNING 状态的
+  },
+});
+
+if (!stepExecution) {
+  stepExecution = await prisma.workflowStepExecution.create({...});
+  // 两个副本都没找到 → 同时 create → 产生 2 行同 (executionId, stepId)
+} else {
+  stepExecution = await prisma.workflowStepExecution.update({
+    where: {id: stepExecution.id},
+    data: {status: StepExecutionStatus.RUNNING, startedAt: ...},
+    // ★ 没有 version 字段做乐观锁
+  });
+}
+```
+
+### 在多副本下的竞态推演
+
+```
+           Worker 副本 A                          Worker 副本 B
+                │                                     │
+  findFirst(PENDING/RUNNING)                 findFirst(PENDING/RUNNING)
+                │                                     │
+           (都没找到)                             (都没找到)
+                │                                     │
+  create(status=RUNNING)                      create(status=RUNNING)
+                │                                     │
+  (DB返回: id=A, 200)                        (DB返回: id=B, 200)
+                └──────────────┬──────────────────────┘
+                               ▼
+              同一个 workflow 同一步骤产生了 2 条 StepExecution
+              两条都后续执行 SEND_EMAIL / WEBHOOK
+              → 重复发邮件 / 重复发 webhook ★
+```
+
+### 其他"乐观保护"的现状评估
+
+| 资源 | 乐观锁 / 唯一约束 | 机制位置 |
+|------|------------------|---------|
+| **StepExecution 防重跑** | ❌ 无 DB 唯一约束，无 version 字段 | 只靠 BullMQ 锁 + jobId 幂等（非 DB 级） |
+| **WorkflowExecution 推进** | ❌ update 不带 `where: {status: PREV}` | L133 / L1157 都是纯 `where: {id}` 覆盖 |
+| **BullMQ Job 防重复 add** | ✅ 显式 jobId = `workflow-${execId}-${stepId}` | 同 jobId 二次 add 会被 BullMQ 拒绝 |
+| **工作流防重复启动** | ✅ `allowReentry=false` 时 L437-L446 查 DB 历史 | `startWorkflowForContact` 先查后插（仍有竞态窗口，但通常是用户交互节奏不敏感） |
+| **Transition 防重复创建** | ❌ `@@unique([fromStepId, toStepId])` 不存在 | 用户在 UI 上画两条相同连线 → 会产生两条同 from/to 的 transition |
+
+---
+
+## 十六、fan-out（一对多出口）与单线程推进的潜在冲突
+
+### 数据模型支持 fan-out，但执行引擎强语义是"pick first"
+
+数据模型上，一个 `fromStepId` 可以有 **任意多条** `WorkflowTransition`，按 `priority` 排序：
+
+```
+WorkflowTransition 表（示例）
+──────────────────────────────────────────────
+  fromStepId | toStepId | condition | priority
+  ───────────┼──────────┼───────────┼─────────
+  Step-Cond  | Step-Yes | {branch:yes}| 1
+  Step-Cond  | Step-No  | {branch:no} | 2
+  Step-Cond  | Step-Log | null        | 3    ← 无条件永远匹配，但永远不会被执行
+```
+
+**processNextSteps 选择算法** [L1113-L1141](file:///d:/fz/0601-1/solo-dogfeeding/code/57-plunk/apps/api/src/services/WorkflowExecutionService.ts#L1113-L1141)：
+
+```
+for (按 priority 升序遍历 transition) {
+  // 选中第一个 match 的，break，只推进 1 个 next step
+}
+
+// 后续：
+update workflowExecution.currentStepId = nextStep.id   ★ 单指针
+await processStepExecution(executionId, nextStep.id)    ★ 串行递归推进
+```
+
+### 三个"看似能 fan-out，实际不会并行"的例子
+
+#### 例子 1：CONDITION 之后想"命中 YES 的同时还走一个审计步骤"
+```
+        ┌─ Yes 分支 (条件匹配) ──▶ Webhook
+COND ──┤
+        └─ Audit (无条件) ──▶ LogStep
+```
+在当前引擎中，若 Yes 分支 priority=1、Audit priority=2：
+- 第一个匹配 Yes 分支，break → Audit 永远不执行
+- 用户在 DAG 编辑器上看到两条连线都画了，但只有一条走得到（这是一个 **silent failure**）
+
+#### 例子 2：用户想并行发 2 个 webhook
+```
+          ┌─▶ WebhookA (notify-partners)
+Trigger ──┤
+          └─▶ WebhookB (notify-slack)
+```
+两条 transition priority=1、priority=2、都 condition=null：
+- priority=1 的被选中，另一条永远跳过
+
+#### 例子 3：WAIT_FOR_EVENT 的 timeout/fallback 分支与正常"事件到了"的分支
+processTimeout 是独立代码路径，只认 `{branch: 'timeout'}` / `{fallback: true}`，所以这个场景语义上被正确分离——但这是手写的特例代码，不是通用引擎能力。
+
+### 引擎是串行推进深度优先，不是 BFS 也不是并行
+
+`processStepExecution → processNextSteps → processStepExecution → ...` 形成一个深度递归链。在 BullMQ 的一次 Job 处理过程中，整个链路上所有步骤（只要不进入 WAITING/DELAY）都在**同一个 Worker 的同一个 async 调用栈**里跑完。
+
+```
+BullMQ Job (一次process)
+   │
+   ▼
+processStepExecution(Trigger)  ─▶ 同步执行
+   │
+   ▼
+processNextSteps → pick first
+   │
+   ▼
+processStepExecution(CONDITION) ─▶ 同步执行，返回 branch='yes'
+   │
+   ▼
+processNextSteps → pick first
+   │
+   ▼
+processStepExecution(WEBHOOK)  ─▶ 同步执行 safeFetch()
+   │
+   ▼
+processNextSteps → (无出口) COMPLETED
+   │
+   ▼
+Job ack
+```
+
+**并发模型总结**：
+- **job 之间**：由 BullMQ 并发度控制（concurrency=10 × 副本数），天然并行
+- **同一条 execution 内部**：深度串行，永远单指针 currentStepId 前进，不支持 fan-out 并行
+
+**fan-out 若要真正支持，需要改造的点**：
+1. WorkflowExecution.currentStepId 改成 currentStepIds[] 或独立的 Token/令牌表
+2. processNextSteps 改为 `Promise.all()` 多个 next step 同时入队
+3. 所有 update execution / create stepExecution 的地方引入乐观锁或 `SELECT ... FOR UPDATE SKIP LOCKED`
+4. completion 条件从"currentStepId is null"改成"所有可达出口都 COMPLETED"
+
+在当前版本里，UI 层（DAG 编辑器）允许画出多对多的箭头是一种"未来扩展性"的提前设计，但引擎语义上等价于一个 `switch-case`。
