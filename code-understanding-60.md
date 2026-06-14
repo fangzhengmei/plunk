@@ -283,7 +283,158 @@ interface LimitCheckResult {
 
 ---
 
-## 十、系统边界总结
+## 十、深度边界场景分析
+
+### 10.1 BullMQ Meter Worker 重试 10 次失败后幂等键的流向
+
+#### 配置回顾
+meterQueue 配置了 `attempts: 10` + 指数退避（初始 5 秒）+ `removeOnFail: 10000`（保留最近 1 万个失败作业），见 [QueueService.ts#L164-L175](file:///d:/fz/0601-1/solo-dogfeeding/code/60-plunk/apps/api/src/services/QueueService.ts#L164-L175)。
+
+#### 失败后的状态
+- **作业状态**：BullMQ 将 job 标记为 `failed`，存储在 Redis 的 `meter:failed` 集合中
+- **幂等键去向**：随 `job.data` 完整保留在失败作业中，**没有死信队列（DLQ）**，也没有自动补偿机制
+- **Worker 侧**：[meter-processor.ts#L49-L51](file:///d:/fz/0601-1/solo-dogfeeding/code/60-plunk/apps/api/src/jobs/meter-processor.ts#L49-L51) 只打印 error 日志，不做额外处理
+
+#### 业务后果
+- **单边漏账**：邮件已成功发送（SENT 状态），用户实际使用了服务，但 Stripe 账单上没收钱 → **平台收入损失**
+- **幂等键锁死**：即使后续 Stripe 恢复，也不会自动重发失败的 meter event，因为失败作业只是静静躺在 Redis 里
+- **量级**：由于并发 5 + 50/秒限流，正常情况下不会大面积失败；但如果 Stripe 长时间不可用（超过 10 次指数退避总时长），就会产生漏账
+
+#### 与内部限制的关系
+内部用量计数（限制判断用）在 email.create 时就已经 +1，不受 Meter Worker 失败影响。所以会出现**「限制已占用但没收到钱」**的剪刀差。
+
+---
+
+### 10.2 Email 由 SENT 退回 FAILED 是否反向 decrement Redis 用量
+
+#### 结论先行：**不会 decrement，也不存在 SENT → FAILED 的状态流转**
+
+#### 状态机分析
+Email 的状态流转是单向的：
+```
+PENDING → SENDING → SENT → DELIVERED → OPENED → CLICKED
+                    ↘ BOUNCED
+                    ↘ COMPLAINED
+         ↘ FAILED (发送前/发送中失败)
+```
+
+- **FAILED 只发生在 SENDING 阶段**：SES 调用抛出异常时设置（[email-processor.ts#L269-L276](file:///d:/fz/0601-1/solo-dogfeeding/code/60-plunk/apps/api/src/jobs/email-processor.ts#L269-L276)）
+- **SENT 之后是终态前置**：SES 已接受发送请求并返回 messageId，后续只会收到 delivery/bounce/complaint 等 SNS 事件，不会再回到 FAILED
+
+#### incrementUsage 的调用时机
+关键发现：**incrementUsage 发生在 email.create 时（PENDING 状态），不是 SENT 时**。
+
+代码证据：[EmailService.ts#L89-L108](file:///d:/fz/0601-1/solo-dogfeeding/code/60-plunk/apps/api/src/services/EmailService.ts#L89-L108)
+```typescript
+const email = await prisma.email.create({... status: PENDING ...});
+await BillingLimitService.incrementUsage(projectId, sourceType);
+await this.queueEmail(email.id, sourceType);
+```
+
+#### 业务后果
+- **发送失败但额度已扣**：如果邮件最终发送失败（FAILED），用户的用量额度已经被占用了，不会退还
+- **设计哲学**：宁可多算（占用额度）不可少算，本质是**保守的限制策略**
+- **与 Stripe 计费的不对称**：
+  - 内部限制：创建即计数（PENDING 时）
+  - Stripe 计费：发送成功才计数（SENT 时）
+  - 两者之间存在「创建了但没发出去」的差值
+
+#### 全局验证
+全局搜索 `decrement|decUsage|decreaseUsage` 无任何匹配，确认系统中完全没有用量回退机制。
+
+---
+
+### 10.3 customer.subscription.* webhook 触发 tier 切换的事件流
+
+#### 触发免费版的完整条件
+见 [BillingLimitService.ts#L203](file:///d:/fz/0601-1/solo-dogfeeding/code/60-plunk/apps/api/src/services/BillingLimitService.ts#L203-L203)：
+```typescript
+if (STRIPE_ENABLED && !project.subscription && !hasCustomLimits) {
+  // 进入免费版模式（1000 封共享额度）
+}
+```
+
+**三个条件必须同时满足**：
+1. `STRIPE_ENABLED === true`（全局开关）
+2. `project.subscription === null`（无活跃订阅）
+3. `hasCustomLimits === false`（四个 billingLimit* 字段全为 null）
+
+#### customer.subscription.deleted 事件流
+代码位置：[Webhooks.ts#L645-L672](file:///d:/fz/0601-1/solo-dogfeeding/code/60-plunk/apps/api/src/controllers/Webhooks.ts#L645-L672)
+
+```
+Stripe 发送 customer.subscription.deleted
+  → 按 subscriptionId 查找 project
+  → project.subscription = null  // 只清了 subscription 字段
+  → 发 Ntfy 通知
+  → 结束
+```
+
+**关键发现**：**billingLimit* 字段完全不动**。
+
+#### 这意味着什么？
+分两种情况：
+
+| 场景 | 取消订阅前 | 取消订阅后 | tier 切换？ |
+|---|---|---|---|
+| **场景 A：默认付费用户** | subscription 存在，billingLimit* 全 null | subscription = null，billingLimit* 全 null → `hasCustomLimits = false` | ✅ **自动切回免费版**（1000 封/月） |
+| **场景 B：设置过自定义限额的用户** | subscription 存在，billingLimitCampaigns = 50000 | subscription = null，但 billingLimitCampaigns = 50000 → `hasCustomLimits = true` | ❌ **不切换**，继续按自定义限额执行 |
+
+也就是说：**如果用户曾经改过任何一个类别的限额，取消订阅后不会自动跌回免费版**，而是继续用他设置的自定义限额。
+
+#### customer.subscription.updated 事件
+见 [Webhooks.ts#L674-L696](file:///d:/fz/0601-1/solo-dogfeeding/code/60-plunk/apps/api/src/controllers/Webhooks.ts#L674-L696)
+- 只打印日志 + 发 Ntfy 通知
+- **不修改任何限额字段**，也不处理 plan 变更（upgrade/downgrade）
+- 实际计费由 Stripe Meter Event 的单价决定，限额是用户自己在 UI 里设的软上限
+
+#### 支付失败的特殊路径
+`invoice.payment_failed` 会把项目 `disabled = true, disabledReason = 'PAYMENT_FAILED'`（[Webhooks.ts#L617-L620](file:///d:/fz/0601-1/solo-dogfeeding/code/60-plunk/apps/api/src/controllers/Webhooks.ts#L617-L620)），这是更彻底的阻断——不仅是限额，项目整个不可用。
+
+---
+
+### 10.4 PUT /billing-limits 把限额调到已用量之下时的缓存与通知顺序
+
+#### 执行顺序
+代码位置：[Users.ts#L354-L380](file:///d:/fz/0601-1/solo-dogfeeding/code/60-plunk/apps/api/src/controllers/Users.ts#L354-L380)
+
+```
+1. prisma.project.update         // 更新数据库中的限额字段
+2. clearNotificationCacheForChangedLimits  // 清除通知缓存（warning/limit email 的 SETNX key）
+3. getLimitsAndUsage             // 返回最新限额+用量给前端
+```
+
+#### 两个关键问题
+
+##### 问题一：会立刻触发告警邮件吗？
+**不会。**
+
+- 告警邮件只在 `checkLimit` 方法内触发（即下一次发送邮件时）
+- `getLimitsAndUsage` 只是计算 `isWarning / isBlocked` 状态返回给前端，**不触发通知**
+- `clearNotificationCacheForChangedLimits` 只是清掉「这个月已经发过告警」的标记
+
+所以场景：
+> 已用 500 封，限额从 10000 调到 100
+
+- ✅ 通知缓存被清掉了（下次到阈值可以重发）
+- ❌ 不会立刻发一封「你超了」的邮件
+- ⏳ 要等下一次 `checkLimit` 调用（即用户再发一封邮件时）才会触发超限邮件
+
+##### 问题二：用量缓存会被清掉吗？
+**不会。**
+
+- `clearNotificationCacheForChangedLimits` 只清 `billing:warning_email:*` 和 `billing:limit_email:*` 这两类通知 key
+- **用量缓存 key（`billing:usage:*`）完全不受影响**
+- 所以调低限额后，前端在 5 分钟缓存窗口内看到的 usage 数字可能还是旧的（不过 `getLimitsAndUsage` 调用的 `getUsage` 有缓存用缓存、没缓存查 DB，最终还是准的）
+
+##### 问题三：清缓存和更新 DB 的顺序有问题吗？
+**顺序是对的**：先更 DB，再清缓存。
+- 如果反过来（先清缓存再更 DB），中间窗口期的请求可能读到旧 limit 但触发了新的 notification key
+- 当前顺序下，最坏情况是 DB 已更新但缓存还在的短暂窗口（最多 5 分钟）内，通知可能发不出来（因为用的是旧阈值判断，但 notification key 可能已经按旧阈值发过了）
+
+---
+
+## 十一、系统边界总结
 
 ```
                     ┌─────────────────────────────────┐
