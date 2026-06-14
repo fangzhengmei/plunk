@@ -1,4 +1,56 @@
-# 账单计量 — 六处遗漏边界分析
+# 账单计量 — 代码边界深度分析
+
+## 全局总览（含 Dead-Letter 设计）
+
+### 双轨计量体系
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                         限制判断（内部用）                              │
+│                                                                      │
+│  Email 创建 (PENDING)                                                │
+│   → BillingLimitService.incrementUsage()                             │
+│     → redis.incr(billing:usage:{project}:{sourceType}:{YYYY-MM})    │
+│                                                                      │
+│   数据源: prisma.email.count() + Redis 缓存(5min TTL)                │
+│   触发: checkLimit() 邮件入队前同步检查                                │
+│   失败策略: Fail-Open (错误时 allowed:true)                          │
+└─────────────────────────────────┬───────────────────────────────────┘
+                                  │
+                                  ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│                         计费计量（Stripe 账单）                         │
+│                                                                      │
+│  邮件发送成功 (SES 返回 messageId)                                   │
+│   → email-processor.ts#L241-L248                                     │
+│     → MeterService.recordEmailSent(customerId, count, idempotencyKey)│
+│       → QueueService.queueMeterEvent(...)                            │
+│         → BullMQ meterQueue (attempts:10, backoff:5s指数)           │
+│           → meter-processor Worker (并发5, 限流50/秒)                │
+│             → stripe.billing.meterEvents.create()                    │
+│                                                                      │
+│  ★ 幂等键: email_{emailId} / batch_{batchId}                         │
+│  ★ 附件加倍: 有附件计 2 封                                           │
+│  ★ 无 Dead-Letter Queue: 10次重试全失败后                          │
+│     └─ Job 留在 meter:failed 集合（removeOnFail:10000）              │
+│     └─ 没有补偿/重放机制                                             │
+│     └─ 幂等键随 job.data 保留，但永远不会再被处理                     │
+│     → 后果: 单边漏账（邮件已发但未计费）                                │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+### BullMQ 队列配置一览（与计量/限制相关）
+
+| Queue | attempts | backoff | removeOnFail | DLQ | 备注 |
+|---|---|---|---|---|---|
+| emailQueue | 3 | 2s 指数 | 5000 | ❌ 无 | 邮件发送 |
+| meterQueue | **10** | 5s 指数 | 10000 | ❌ 无 | Stripe 计量事件 |
+| campaignQueue | 3 | 5s 指数 | 500 | ❌ 无 | 营销活动批量 |
+| workflowQueue | 3 | 2s 指数 | 5000 | ❌ 无 | 工作流步骤 |
+
+所有队列**均未配置死信队列**，重试耗尽后作业留在 `{queue}:failed` Redis 集合中，后续完全依赖人工排查或清理。
+
+---
 
 ## 一、Stripe checkout 完成事件写 subscription 入口
 
