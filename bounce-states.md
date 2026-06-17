@@ -280,9 +280,290 @@ const baseWhere = {
 
 ---
 
-## 五、清单清洗策略
+## 五、订阅状态（subscribed）写入入口全集
 
-### 5.1 退订触发条件
+Contact.subscribed 字段是清单清洗机制的基石。以下是所有能修改该字段的入口，按调用路径分类：
+
+### 5.1 SNS Webhook（系统自动退订）
+
+这是硬退/投诉触发的自动退订入口，由 SES SNS 回调驱动。
+
+| 触发事件 | 代码位置 | 写入动作 |
+|---|---|---|
+| 硬退 Permanent Bounce | [Webhooks.ts L385-L388](file:///d:/fz/0601-2/solo-dogfeeding/code/15-plunk/apps/api/src/controllers/Webhooks.ts#L385-L388) | `subscribed = false` |
+| 未知类型 Bounce | [Webhooks.ts L421-L424](file:///d:/fz/0601-2/solo-dogfeeding/code/15-plunk/apps/api/src/controllers/Webhooks.ts#L421-L424) | `subscribed = false`（当作硬退处理） |
+| 投诉 Complaint | [Webhooks.ts L436-L439](file:///d:/fz/0601-2/solo-dogfeeding/code/15-plunk/apps/api/src/controllers/Webhooks.ts#L436-L439) | `subscribed = false` |
+| 软退 Transient Bounce | — | **不修改**（仅记录事件） |
+
+**特点**：所有写操作都是单向的——只会设 `false`，永远不会在此处重新设 `true`。
+
+### 5.2 单个联系人的增删改（ContactService 基础方法）
+
+这些是 REST API 单条操作入口，最终都走 [ContactService](file:///d:/fz/0601-2/solo-dogfeeding/code/15-plunk/apps/api/src/services/ContactService.ts)。
+
+| 方法 | 入口端点 | 订阅写入规则 | 状态变更事件 |
+|---|---|---|---|
+| [create](file:///d:/fz/0601-2/solo-dogfeeding/code/15-plunk/apps/api/src/services/ContactService.ts#L124-L144) | `POST /contacts` | `subscribed ?? true`，不传默认 **订阅** | 不追踪（新建无变更） |
+| [update](file:///d:/fz/0601-2/solo-dogfeeding/code/15-plunk/apps/api/src/services/ContactService.ts#L191-L245) | `PATCH /contacts/:id` | 请求体中传 `subscribed` 才更新，不传保留原值 | 变化时追踪 `contact.subscribed` / `contact.unsubscribed` |
+| [upsert](file:///d:/fz/0601-2/solo-dogfeeding/code/15-plunk/apps/api/src/services/ContactService.ts#L273-L339) | `POST /contacts`、`POST /v1/send`、`POST /v1/track` | 新建时 `subscribed ?? defaultSubscribed`（默认 true）；更新时仅在显式传 `subscribed` 时才改 | 变化时追踪 |
+| [subscribe](file:///d:/fz/0601-2/solo-dogfeeding/code/15-plunk/apps/api/src/services/ContactService.ts#L427-L437) | `POST /contacts/public/:id/subscribe` | 强制 `true`（公开页面，用户点击订阅链接） | 追踪 `contact.subscribed` |
+| [unsubscribe](file:///d:/fz/0601-2/solo-dogfeeding/code/15-plunk/apps/api/src/services/ContactService.ts#L442-L452) | `POST /contacts/public/:id/unsubscribe`、邮件退订链接 | 强制 `false`（公开页面，用户点击退订链接） | 追踪 `contact.unsubscribed` |
+
+**注意 `upsert` 的 `defaultSubscribed` 参数默认值差异**：
+
+| 调用方 | `defaultSubscribed` 值 | 含义 |
+|---|---|---|
+| `POST /contacts`（Contacts 控制器） | 默认 `true` | 通过 Dashboard 手动添加默认订阅 |
+| `POST /v1/send`（事务性 API，[Actions.ts L274](file:///d:/fz/0601-2/solo-dogfeeding/code/15-plunk/apps/api/src/controllers/Actions.ts#L274)） | 显式传 `false` | 新收件人默认**不订阅**（符合反垃圾邮件要求） |
+| `POST /v1/track`（事件追踪，[Actions.track L77-L82](file:///d:/fz/0601-2/solo-dogfeeding/code/15-plunk/apps/api/src/controllers/Actions.ts#L77-L82)） | 默认 `true` | 追踪事件创建的新联系人默认订阅 |
+
+### 5.3 批量订阅/退订（bulk 操作队列）
+
+入口端点：`POST /contacts/bulk-subscribe`、`POST /contacts/bulk-unsubscribe`，由 [Contacts.ts L435-L451](file:///d:/fz/0601-2/solo-dogfeeding/code/15-plunk/apps/api/src/controllers/Contacts.ts#L435-L451) 接收，通过 `queueBulkContactAction` 进入 BullMQ 的 `bulkContactQueue`，由 [bulk-contact-processor](file:///d:/fz/0601-2/solo-dogfeeding/code/15-plunk/apps/api/src/jobs/bulk-contact-processor.ts#L62-L190) Worker 处理。
+
+**两种匹配模式**（BATCH_SIZE=100）：
+
+| selector.mode | 匹配方式 | 实现 |
+|---|---|---|
+| `ids` | 直接传 `contactIds` 数组 | 按 id 分批调用 Service 方法 |
+| `query` | 基于 `filter.search / filter.subscribed / excludeIds` 构建 WHERE 子句 | 先 count 再用游标 `id < lastId` 倒序遍历（对 delete 安全，避免删除后游标跳跃） |
+
+实际修改委托给 [ContactService.bulkSubscribe](file:///d:/fz/0601-2/solo-dogfeeding/code/15-plunk/apps/api/src/services/ContactService.ts#L726-L758) / [bulkUnsubscribe](file:///d:/fz/0601-2/solo-dogfeeding/code/15-plunk/apps/api/src/services/ContactService.ts#L765-L797)：
+- 先查询每个 Contact 的当前状态，只对**确实需要翻转**的 id 调用 `updateMany`
+- 返回 `{updated, unchanged}`，已在目标状态的联系人被当作"无操作"不计入失败
+- 成功翻转的联系人逐个追踪 `contact.subscribed` / `contact.unsubscribed` 事件（异步串行，避免 DB 死锁）
+
+### 5.4 CSV 导入任务
+
+入口端点：`POST /contacts/import`，[Contacts.ts L316-L344](file:///d:/fz/0601-2/solo-dogfeeding/code/15-plunk/apps/api/src/controllers/Contacts.ts#L316-L344) 接收 CSV 文件后转 base64 入 `importQueue`，由 [import-processor](file:///d:/fz/0601-2/solo-dogfeeding/code/15-plunk/apps/api/src/jobs/import-processor.ts#L27-L214) Worker 处理。
+
+**CSV 中订阅状态的处理规则**（[import-processor L114-L122](file:///d:/fz/0601-2/solo-dogfeeding/code/15-plunk/apps/api/src/jobs/import-processor.ts#L114-L122)）：
+
+```
+CSV 的 subscribed 列（大小写不敏感）
+  ├─ 空 / 不存在      → subscribed = undefined
+  │     ├─ 新建 Contact → 默认 subscribed=true（由 ContactService.upsert defaultSubscribed）
+  │     └─ 已有 Contact → 保持原有值不变
+  ├─ "true" / "1" / "yes" → subscribed = true
+  └─ 其他值             → subscribed = false
+```
+
+**注意**：
+- 数字 `0` 和 `1` 不被识别（代码里只判断了字符串 "1"），数字形式会被当作 `false`
+- 已有 Contact 如果 CSV 没传 subscribed 列，**不会**被误改订阅状态
+- 每行走 `ContactService.upsert`，更新时会触发订阅状态变更事件
+
+### 5.5 工作流 UPDATE_CONTACT 步骤
+
+工作流中的 `UPDATE_CONTACT` 类型步骤可在运行时修改联系人订阅状态。
+
+代码位置：[WorkflowExecutionService.executeUpdateContact](file:///d:/fz/0601-2/solo-dogfeeding/code/15-plunk/apps/api/src/services/WorkflowExecutionService.ts#L1033-L1085)
+
+```
+config.subscriptionAction
+  ├─ 'subscribe'   → subscribed = true（仅当原值为 false 时更新）
+  ├─ 'unsubscribe' → subscribed = false（仅当原值为 true 时更新）
+  └─ undefined     → 不修改订阅状态
+```
+
+同时还可通过 `config.updates` 更新 data 自定义字段。**订阅变更只在实际翻转时才写 DB 并追踪事件**（`subscriptionChanging` 判断），不做无意义的同值更新。
+
+这是工作流中唯一一个能主动让联系人重新订阅的入口（硬退/投诉只能退订）。典型场景：联系人在工作流中点击"确认订阅"按钮 → 触发 UPDATE_CONTACT subscribe → 后续营销类步骤可正常发送。
+
+### 5.6 事件追踪 API（/v1/track）
+
+入口：[Actions.track](file:///d:/fz/0601-2/solo-dogfeeding/code/15-plunk/apps/api/src/controllers/Actions.ts#L52-L92)（`POST /v1/track`）
+
+订阅状态来源是请求体的 `subscribed` 字段，通过 `ContactService.upsert(auth.projectId, email, data, subscribed)` 写入。
+
+- **显式传 `subscribed: true/false`** → 按值写入，有变化则追踪事件
+- **不传** → 新建时默认订阅（`defaultSubscribed=true`），已有联系人保持不变
+
+这是最灵活的外部入口，可被集成系统用来同步外部系统的订阅偏好。
+
+### 5.7 写入入口汇总
+
+```
+                          subscribed 字段写入点
+  ┌──────────────────────────────────────────────────────────┐
+  │ 系统自动（单向退订）                                       │
+  │   ├─ 硬退 Permanent Bounce → Webhooks → subscribed=false │
+  │   ├─ 未知类型 Bounce       → Webhooks → subscribed=false │
+  │   └─ 投诉 Complaint        → Webhooks → subscribed=false │
+  ├──────────────────────────────────────────────────────────┤
+  │ 用户自助（通过链接）                                        │
+  │   ├─ POST /contacts/public/:id/subscribe   → true        │
+  │   └─ POST /contacts/public/:id/unsubscribe → false       │
+  ├──────────────────────────────────────────────────────────┤
+  │ API / 操作面板（单条）                                      │
+  │   ├─ ContactService.create      → ?? true                │
+  │   ├─ ContactService.update      → 请求体决定              │
+  │   ├─ ContactService.upsert      → 请求体 + defaultSub    │
+  │   └─ POST /v1/track (Actions)   → 请求体决定              │
+  ├──────────────────────────────────────────────────────────┤
+  │ 批量操作（队列异步）                                        │
+  │   ├─ bulk-subscribe   → bulk-contact-processor → true   │
+  │   ├─ bulk-unsubscribe → bulk-contact-processor → false  │
+  │   └─ CSV import       → import-processor → 按列解析      │
+  ├──────────────────────────────────────────────────────────┤
+  │ 工作流步骤                                                 │
+  │   └─ UPDATE_CONTACT step → subscriptionAction 决定       │
+  └──────────────────────────────────────────────────────────┘
+```
+
+---
+
+## 六、硬退/投诉对四类发送场景的完整影响分支
+
+硬退/投诉造成的核心变化是：`contact.subscribed = false`  + （若超限则）`project.disabled = true`。下面按四类发送场景逐一展开影响分支。
+
+### 6.1 营销活动（Campaign，非事务性）
+
+假设某 Contact 在活动开始时处于订阅状态，在第 1 批发出邮件后立即因硬退被退订。完整的影响链路：
+
+```
+第 1 批 processBatch
+  ├─ buildRecipientWhereAsync → subscribed=true → Contact 命中
+  ├─ sendCampaignEmail → 创建 Email(PENDING) → 入 emailQueue
+  └─ Worker 发送 → SES 接受 → SENT → SNS Delivery 推送 → DELIVERED
+       └─ 但收件方 MTA 返回硬退 → SNS 推送 Bounce(Permanent)
+            ├─ Webhooks: Email.status → BOUNCED
+            ├─ Webhooks: Contact.subscribed → false   ★ 关键分叉点
+            └─ Webhooks: 安全阈值检查
+                 └─ 超限? → YES → project.disabled=true
+                           └─ NO  → 项目继续运行
+
+第 2 批 processBatch（稍后执行）
+  ├─ buildRecipientWhereAsync
+  │    └─ subscribed=true 条件 + Contact 已退订
+  │         └─ Contact 不在结果集中 → **不会为其创建 Email 记录**
+  └─ 继续处理其他联系人
+
+第 N 批（如果项目被禁用）
+  └─ 所有已入队的 PENDING 邮件被 SecurityService 批量标 FAILED
+```
+
+| 影响项 | 未超限 | 超限（项目被禁） |
+|---|---|---|
+| 后续批次 | 自动排除退订 Contact，其他联系人流畅发送 | 所有 PENDING 邮件 FAILED，取消队列 job，Campaign 终止 |
+| 本批次已发出的邮件 | 无法撤回，该 Contact 仍收到本批次内容 | 同左 |
+| 活动统计 | BOUNCED 计入 bounceRate；正常邮件按 SENT 统计 | 活动状态变为 FAILED（SecurityService 终止 Campaign） |
+| 退信率 | BOUNCED 会被 SecurityService 纳入 7 天/全局计算 | 同上，但项目已被冻结 |
+
+### 6.2 营销工作流（Workflow，非事务性模板）
+
+工作流的执行是连续步骤链式推进，每个 SEND_EMAIL 步骤单独检查订阅状态。假设某 Contact 在工作流的步骤 1（确认邮件）后因回复硬退被退订：
+
+```
+工作流执行链：
+  Step 1: SEND_EMAIL (营销模板)
+    ├─ sendWorkflowEmail → sourceType=WORKFLOW, 无recipientEmail
+    ├─ 检查 subscribed=true → ✅ 通过
+    ├─ 创建 Email(PENDING) → 入队 → 发送 → SENT
+    └─ 硬退 SNS 推送 → Contact.subscribed=false ★
+
+  Step 2: CONDITION (例：3 天后检查是否打开)
+    └─ 不涉及订阅 → 正常评估条件
+
+  Step 3: SEND_EMAIL (营销模板, 跟进邮件)
+    ├─ sendWorkflowEmail → 检查 subscribed
+    │   └─ subscribed=false → ❌ 拦截
+    │        ├─ 创建 Email(FAILED, error='Contact is unsubscribed from marketing emails')
+    │        ├─ 不入 emailQueue，Worker 不会处理
+    │        └─ 步骤状态 → completed（继续执行，不中断流程）
+    └─ 工作流流转到 Step 4
+
+  Step 4: SEND_EMAIL (事务性模板, 如账户通知)
+    ├─ sourceType=TRANSACTIONAL → 不检查订阅
+    ├─ 创建 Email(PENDING) → 入队 → 发送
+    └─ ✅ 即使退订也正常送达
+
+  Step 5: UPDATE_CONTACT (subscriptionAction='subscribe', 如用户点击确认)
+    └─ subscribed 被重新设为 true → 后续营销步骤恢复可发送
+```
+
+| 影响项 | 结果 |
+|---|---|
+| SEND_EMAIL（营销） | 静默跳过，创建 FAILED，工作流不中断 |
+| SEND_EMAIL（事务性） | 照常发送，不检查订阅 |
+| UPDATE_CONTACT | 可重新订阅，解除后续拦截 |
+| 自定义收件人（`recipientEmail`） | **完全绕过 Contact 订阅检查**（见 6.4） |
+| 工作流执行本身 | 订阅拦截不导致工作流中止或失败 |
+
+### 6.3 事务性邮件（API /v1/send）
+
+事务性邮件没有"营销活动/工作流"的批量上下文，每封邮件独立。硬退/投诉的影响取决于后续是否继续调用 `/v1/send`。
+
+**事务性 API 的订阅分支**（[EmailService.sendTransactionalEmail](file:///d:/fz/0601-2/solo-dogfeeding/code/15-plunk/apps/api/src/services/EmailService.ts#L31-L105)）：
+
+```
+POST /v1/send
+  └─ 选择模板
+       ├─ 无模板 或 模板.type=TRANSACTIONAL
+       │    └─ 完全不检查 subscribed
+       │         ├─ 创建 Email(PENDING) → 入队 → 发送
+       │         └─ 即使退订也会发送（故意设计：验证码、订单通知等必须送达）
+       │
+       └─ 模板.type=MARKETING
+            └─ 检查 subscribed
+                 ├─ subscribed=true → ✅ 发送
+                 └─ subscribed=false → ❌ 抛 400 "This email is unsubscribed."
+                      ├─ 不创建 Email 记录
+                      └─ 不入队，直接返回错误
+```
+
+**新收件人特殊分支**（[Actions.ts L274](file:///d:/fz/0601-2/solo-dogfeeding/code/15-plunk/apps/api/src/controllers/Actions.ts#L274)）：
+- `/v1/send` 调用 `ContactService.upsert(..., defaultSubscribed=false)`，**新收件人默认退订**
+- 但如果传的是事务性模板 → 即使默认退订也发送（因为不检查订阅）
+- 第一次调用会创建一个 `subscribed=false` 的 Contact，后续用营销模板调用会被拒
+- 如果需要新收件人可接收营销邮件，必须先通过 `/v1/track` 或 `/contacts` API 显式传 `subscribed: true`
+
+| 场景 | 是否检查订阅 | 退订后行为 |
+|---|---|---|
+| 无模板事务性邮件 | 否 | 正常发送 |
+| 事务性模板 | 否 | 正常发送 |
+| 营销模板 | 是 | 返回 400，不发 |
+| 项目被安全机制禁用（不管什么模板） | Worker 层检查 | 创建了 PENDING 也会被 Worker 标 FAILED |
+
+### 6.4 自定义收件人发送（recipientEmail 覆盖）
+
+这是工作流的一个特殊功能：在 SEND_EMAIL 步骤配置中通过 `recipientEmail` 字段指定一个**不同于 Contact.email** 的收件地址（例如发送到联系人的备用邮箱、或 CC 某个审批人）。
+
+**实现机制**（[EmailService.sendWorkflowEmail](file:///d:/fz/0601-2/solo-dogfeeding/code/15-plunk/apps/api/src/services/EmailService.ts#L198-L206) + [EmailService.sendRawEmail](file:///d:/fz/0601-2/solo-dogfeeding/code/15-plunk/apps/api/src/services/EmailService.ts#L380-L387)）：
+
+```
+sendWorkflowEmail
+  └─ params.recipientEmail 存在？
+       ├─ YES → 跳过 subscribed 检查（因为收件人可能不在 Contact 列表中）
+       │    ├─ 创建 Email 记录，contactId 仍绑定到原 Contact（用于审计/统计）
+       │    ├─ recipientEmail 写入 headers['X-Plunk-Recipient-Override']
+       │    └─ 入 emailQueue
+       │
+       └─ NO  → 正常检查 subscribed（见 6.2）
+
+Worker email-processor 实际调 SES 时：
+  ├─ 读取 headers['X-Plunk-Recipient-Override']
+  ├─ 若存在 → to: [recipientEmail]（覆盖 contact.email）
+  ├─ 发送前删除该内部 header，不暴露给收件人
+  └─ 若不存在 → to: [contact.email]
+```
+
+**硬退/投诉对自定义收件人的影响**：
+
+| 影响维度 | 结果 |
+|---|---|
+| 订阅检查 | `recipientEmail` 存在时**完全绕过** `contact.subscribed` 检查。即使 Contact 已因硬退退订，后续使用自定义收件人的步骤仍会发送 |
+| 退信归因 | SNS Bounce 事件通过 SES messageId 关联回 Email 记录 → 关联到原 contactId → **原 Contact 被退订**。自定义收件人邮箱本身不在 Contact 表中，退信惩罚落到 Contact 身上 |
+| 自定义收件人自身硬退 | 该自定义邮箱下次再被使用时**仍可发送**——因为它没有独立的订阅/退信状态，不受影响 |
+| 退信率计算 | 退信仍计入项目总体退信率（因为 `projectId` 是关联的），可能触发安全阈值 |
+
+**风险提示**：自定义收件人功能允许向非 Contact 列表中的地址发送。如果滥用此功能（频繁向第三方地址发送营销内容且被退信），虽然不会退订任何 Contact，但会累积项目退信率，严重时会被安全机制禁用项目。
+
+---
+
+## 七、清单清洗策略
+
+### 7.1 退订触发条件
 
 以下两种 SNS 事件会自动将 Contact 的 `subscribed` 设为 `false`：
 
@@ -293,7 +574,7 @@ const baseWhere = {
 | 软退 (Transient Bounce) | — | **不退订** |
 | 未知退信类型 | [Webhooks.ts L409-L427](file:///d:/fz/0601-2/solo-dogfeeding/code/15-plunk/apps/api/src/controllers/Webhooks.ts#L409-L427) | **当作硬退 → 退订** |
 
-### 5.2 退订后对进行中活动的影响
+### 7.2 退订后对进行中活动的影响
 
 一个营销活动在发送过程中（状态 SENDING），按批（BATCH_SIZE=500）处理联系人。**每批的受众查询都是实时从 DB 读取 `subscribed: true` 的 Contact**。
 
@@ -301,24 +582,26 @@ const baseWhere = {
 
 但已经发出的邮件不可撤回，该 Contact 仍会在 SES 层面收到那封邮件。
 
-### 5.3 退订后对进行中工作流的影响
+### 7.3 退订后对进行中工作流的影响
 
 工作流的 SEND_EMAIL 步骤在执行时调用 `sendWorkflowEmail`，此时才检查 `contact.subscribed`。如果 Contact 在工作流执行中途被退订：
 - 下一个 SEND_EMAIL 步骤检查到 `!subscribed` → 创建 FAILED 记录（error='Contact is unsubscribed from marketing emails'），**工作流不中断**，继续执行后续步骤（如 DELAY、CONDITION 等）
 - 只有事务性工作流（模板类型为 TRANSACTIONAL）会忽略退订状态继续发送
 
-### 5.4 退订的不可逆性
+### 7.4 退订的重新订阅路径
 
-Contact 的 `subscribed` 字段只在以下情况被设为 `false`：
-1. 硬退/投诉 SNS Webhook（自动）
-2. 用户点击退订链接（Dashboard `/unsubscribe/:id`）
-3. API 调用 `POST /v1/track` 时显式传 `subscribed: false`
+硬退/投诉只能将 `subscribed` 设为 `false`，不能自动恢复。**所有能将 subscribed 重新设为 `true` 的入口**：
 
-重新订阅需要：
-1. 用户点击订阅链接（Dashboard `/subscribe/:id`）
-2. API 调用 `POST /v1/track` 时显式传 `subscribed: true`
+| 入口 | 方式 |
+|---|---|
+| 用户点击邮件中的订阅链接 | `POST /contacts/public/:id/subscribe` → [ContactService.subscribe](file:///d:/fz/0601-2/solo-dogfeeding/code/15-plunk/apps/api/src/services/ContactService.ts#L427-L437) 强制 `true` |
+| 手动调用 REST API | `PATCH /contacts/:id` 传 `{"subscribed": true}` 或 `POST /contacts` 传 `subscribed=true` upsert |
+| 事件追踪 API | `POST /v1/track` 请求体传 `subscribed: true` |
+| 工作流步骤 | `UPDATE_CONTACT` 步骤的 `subscriptionAction='subscribe'` |
+| 批量操作 | `POST /contacts/bulk-subscribe`（ids 或 query 模式） |
+| CSV 导入 | CSV 中 `subscribed` 列传 "true"/"1"/"yes" |
 
-### 5.5 安全阈值与项目停用
+### 7.5 安全阈值与项目停用
 
 [SecurityService.ts L30-L69](file:///d:/fz/0601-2/solo-dogfeeding/code/15-plunk/apps/api/src/services/SecurityService.ts#L30-L69) 定义了双层阈值体系：
 
@@ -351,7 +634,7 @@ Contact 的 `subscribed` 字段只在以下情况被设为 `false`：
 
 ---
 
-## 六、完整状态流转图
+## 八、完整状态流转图
 
 ```
   三条发送入口                              全部汇入
@@ -425,7 +708,7 @@ Contact 的 `subscribed` 字段只在以下情况被设为 `false`：
 
 ---
 
-## 七、关键发现与注意点
+## 九、关键发现与注意点
 
 1. **软退不留痕**：软退（Transient Bounce）不改变 Email.status，不退订 Contact，不计入退信率。仅以 `email.bounce` 事件（含 `transientBounce: true`）留存记录。如果需要"软退 N 次后退订"策略，当前代码不支持。
 
@@ -448,3 +731,13 @@ Contact 的 `subscribed` 字段只在以下情况被设为 `false`：
 9. **活动路径的退订拦截最彻底**：退订 Contact 根本不会产生 Email 记录，而工作流路径只是创建 FAILED 记录但不入队。两者都不会消耗 SES 发送配额，但活动路径更干净——不会在 Email 表中留下 FAILED 垃圾记录。
 
 10. **事务性类型不受退订限制是故意设计，不是遗漏**：三条路径中，只要邮件类型判定为事务性（sourceType=TRANSACTIONAL 或 campaign.type=TRANSACTIONAL），就跳过所有订阅检查。唯一例外是事务性 API 使用了营销模板（此时入口层抛 400）。验证码、密码重置、订单通知等场景本就不应该因为退订而停止送达。
+
+11. **自定义收件人是订阅检查的"旁路"**：工作流的 `recipientEmail` 覆盖机制完全绕过 `contact.subscribed` 检查，通过 `X-Plunk-Recipient-Override` 内部 header 路由到自定义地址。自定义收件人自身没有独立的订阅/退信状态，**硬退惩罚会落到原 Contact 身上**（Contact 被退订），但下次继续用该自定义邮箱仍可发送。
+
+12. **事务性 API 的新收件人默认退订是反垃圾措施**：`/v1/send` 调用 `ContactService.upsert` 时显式传 `defaultSubscribed=false`（[Actions.ts L274](file:///d:/fz/0601-2/solo-dogfeeding/code/15-plunk/apps/api/src/controllers/Actions.ts#L274)），符合反垃圾邮件"默认不营销"原则。但由于事务性模板不检查订阅，**第一次事务性邮件不会受阻**——真正受影响的是后续用该 Contact 发营销模板邮件的场景。
+
+13. **CSV 导入的 subscribed 数字形式会被误判为 false**：import-processor 只识别字符串形式的 "1"，不识别数字 `1`。如果 CSV 导出工具将 subscribed 序列化为数字 0/1，则全部会被当作 false，可能导致导入后联系人全退订。
+
+14. **重新订阅路径共 6 个，且都需要显式触发**：硬退/投诉后 subscribed 不会自动恢复。需要通过：订阅链接、REST API、事件追踪 API、工作流 UPDATE_CONTACT 步骤、批量订阅操作、CSV 导入，其中任何一种方式显式设为 true 才能解除退订状态。
+
+15. **批量操作的游标机制对 delete 安全，但对 subscribe/unsubscribe 也有副作用**：query 模式用 `id < lastId` 倒序分批，是为了避免 delete 后行消失导致的游标跳跃。对 subscribe 来说，如果在操作过程中有新的订阅变更，可能不会被覆盖（因为游标已过）。但批量操作设计上就是"某一时刻的快照"，这个边界可接受。
