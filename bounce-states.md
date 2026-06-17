@@ -157,10 +157,15 @@ Plunk 有三条独立的邮件发送入口，**全部汇聚到同一个 BullMQ `
 
 **受众**：调用方在请求体中指定收件人，不经过任何受众筛选。
 
-**订阅检查**：
-- 仅在使用营销模板时拒绝退订 Contact（[L55-L74](file:///d:/fz/0601-2/solo-dogfeeding/code/15-plunk/apps/api/src/services/EmailService.ts#L55-L74)）：`template.type === 'MARKETING'` 且 `!contact.subscribed` → 抛 400
-- 事务性模板或无模板 → **不受订阅限制**，始终发送
-- **注意**：此处不会查询 Contact 的订阅状态来决定发送与否（除非用了营销模板），退订拦截靠 Worker 层兜底
+**订阅检查（仅限入口层，Worker 不兜底）**：
+- 使用营销模板时（[L55-L74](file:///d:/fz/0601-2/solo-dogfeeding/code/15-plunk/apps/api/src/services/EmailService.ts#L55-L74)）：`template.type === 'MARKETING'` 且 `!contact.subscribed` → 抛 400 错误
+- 事务性模板或无模板 → **完全不检查订阅**，退订 Contact 也会正常发送（事务性邮件设计上不受退订限制）
+- **没有 Worker 层兜底**：email-processor 不检查 `contact.subscribed`，入口层是事务性邮件的唯一订阅拦截点
+
+**事务性 API 的退订相关行为**：
+- 新收件人通过 `ContactService.upsert(..., defaultSubscribed=false)` 创建 → 默认 `subscribed=false`（[Actions.ts L274](file:///d:/fz/0601-2/solo-dogfeeding/code/15-plunk/apps/api/src/controllers/Actions.ts#L274)）
+- 已有收件人的订阅状态被保留（除非请求体显式传 `subscribed`）
+- 退订的收件人仍能收到事务性邮件（非营销模板时）——这是**故意的设计**，用于验证码、订单通知、密码重置等场景
 
 **sourceType**：`EmailSourceType.TRANSACTIONAL`
 
@@ -184,7 +189,7 @@ CampaignService.send()
                                   无更多批次? → finalizeIfDone()
 ```
 
-**受众筛选**（[buildRecipientWhereAsync](file:///d:/fz/0601-2/solo-dogfeeding/code/15-plunk/apps/api/src/services/CampaignService.ts#L866-L906)）：
+**受众筛选（活动路径的核心拦截机制）**（[buildRecipientWhereAsync](file:///d:/fz/0601-2/solo-dogfeeding/code/15-plunk/apps/api/src/services/CampaignService.ts#L866-L906)）：
 
 ```ts
 const baseWhere = {
@@ -206,13 +211,15 @@ const baseWhere = {
 - 活动发送期间如果某个 Contact 因硬退被退订，**后续批次查询时自动排除该 Contact**
 - 动态 Segment 的条件在每批查询时重新求值，联系人离开 Segment 后不会收到后续批次的邮件
 
-**退订后的拦截**（活动路径）：
+**退订后的拦截（活动路径）**：
 
 | 拦截层 | 位置 | 行为 |
 |---|---|---|
 | 受众查询 | [buildRecipientWhereAsync](file:///d:/fz/0601-2/solo-dogfeeding/code/15-plunk/apps/api/src/services/CampaignService.ts#L870-L874) `subscribed: true` | 退订 Contact 不出现在受众列表中，**根本不会为其创建 Email 记录** |
 | Email 创建 | `sendCampaignEmail` 无额外订阅检查 | — （已被受众查询过滤掉） |
-| Worker 层 | [email-processor L99](file:///d:/fz/0601-2/solo-dogfeeding/code/15-plunk/apps/api/src/jobs/email-processor.ts#L99) `status !== PENDING` | 不涉及订阅检查（但下面 4.4 有说明） |
+| Worker 层 | [email-processor](file:///d:/fz/0601-2/solo-dogfeeding/code/15-plunk/apps/api/src/jobs/email-processor.ts#L73-L304) | 不检查 `contact.subscribed`（见 4.4） |
+
+**事务性活动（campaign.type=TRANSACTIONAL）**：不附加 `subscribed: true` 条件，对所有 Contact 发送，不管订阅状态如何。
 
 **sourceType**：营销活动默认 `CAMPAIGN`；若 `isTransactional=true` 或模板类型为 `TRANSACTIONAL` 则为 `TRANSACTIONAL`
 
@@ -222,47 +229,54 @@ const baseWhere = {
 
 **受众**：工作流执行绑定的 Contact（由触发事件决定），不走受众筛选查询。
 
-**订阅检查**（[L200-L234](file:///d:/fz/0601-2/solo-dogfeeding/code/15-plunk/apps/api/src/services/EmailService.ts#L200-L234)）：
+**订阅检查（入口层拦截，Worker 不兜底）**（[L200-L234](file:///d:/fz/0601-2/solo-dogfeeding/code/15-plunk/apps/api/src/services/EmailService.ts#L200-L234)）：
 - 营销工作流（sourceType ≠ TRANSACTIONAL）且无自定义收件人 → 查 `contact.subscribed`
 - `!contact.subscribed` → **静默跳过**：创建 `FAILED` 记录（error='Contact is unsubscribed from marketing emails'），**不入队**，工作流继续执行后续步骤
-- 事务性工作流 → 不检查订阅
+- 事务性工作流（sourceType=TRANSACTIONAL，由模板类型决定） → 不检查订阅
 - 自定义收件人（`recipientEmail`） → 不检查订阅
 
 **sourceType**：默认 `WORKFLOW`；模板类型为 `TRANSACTIONAL` 时为 `TRANSACTIONAL`
 
-### 4.4 Worker 层的最终兜底拦截
+### 4.4 Worker 层的实际行为——无订阅兜底
 
-所有三条路径最终都汇入 [email-processor](file:///d:/fz/0601-2/solo-dogfeeding/code/15-plunk/apps/api/src/jobs/email-processor.ts#L73-L304)。Worker 在实际调 SES 前有一次兜底检查：
+所有三条路径最终都汇入 [email-processor](file:///d:/fz/0601-2/solo-dogfeeding/code/15-plunk/apps/api/src/jobs/email-processor.ts#L73-L304)。Worker 在实际调 SES 前做的检查是：
 
-```ts
-// L99
-if (email.status !== EmailStatus.PENDING) return;  // 幂等保护
+| 检查项 | 代码位置 | 说明 |
+|---|---|---|
+| `status !== PENDING` | [L99-L101](file:///d:/fz/0601-2/solo-dogfeeding/code/15-plunk/apps/api/src/jobs/email-processor.ts#L99-L101) | 幂等保护，跳过已处理邮件 |
+| `project.disabled` | [L103-L119](file:///d:/fz/0601-2/solo-dogfeeding/code/15-plunk/apps/api/src/jobs/email-processor.ts#L103-L119) | 项目禁用则标 FAILED |
+| 钓鱼内容检测 | [L185-L212](file:///d:/fz/0601-2/solo-dogfeeding/code/15-plunk/apps/api/src/jobs/email-processor.ts#L185-L212) | 危险内容则禁项目 + 标 FAILED |
+| **contact.subscribed** | **不存在** | **Worker 完全不检查订阅状态** |
 
-// 注意：email-processor 中没有直接检查 contact.subscribed
-// 但 EmailService.sendEmail 方法中有此检查（见下）
-```
+> ⚠️ 关于 `EmailService.sendEmail` 方法：
+> - 此方法在 [L290-L456](file:///d:/fz/0601-2/solo-dogfeeding/code/15-plunk/apps/api/src/services/EmailService.ts#L290-L456) 有完整的发送逻辑（含 L311-L326 的订阅检查）
+> - 但 grep 全局搜索确认：**生产代码中没有任何地方调用它**，仅在 `__tests__/EmailService.test.ts` 中使用
+> - 生产发送路径是 Worker 内联的发送逻辑 + 入口 Service 层的订阅检查
+> - 结论：`EmailService.sendEmail` 中的订阅检查是**死代码**，对实际行为无影响
 
-另外，[EmailService.sendEmail](file:///d:/fz/0601-2/solo-dogfeeding/code/15-plunk/apps/api/src/services/EmailService.ts#L290-L456)（同步发送路径，不经过队列）在 L311-L326 有订阅检查，但此方法**不是 email-processor 的调用路径**——processor 内联了发送逻辑。
+**三层防护的实际边界**：
 
-> ⚠️ 实际拦截情况：email-processor **没有** 再次检查 `contact.subscribed`。但因为：
-> - 活动路径：受众查询已排除退订 Contact，根本不会创建 Email 记录
-> - 工作流路径：`sendWorkflowEmail` 已拦截退订 Contact，不入队
-> - 事务性路径：设计上不应受订阅限制
->
-> 所以理论上不会出现"退订 Contact 的 PENDING 邮件"进入 Worker。但如果通过 DB 直接插入 Email 记录（绕过 Service 层），则 Worker 不会拦截。
+| 路径 | 订阅检查发生在哪一层 | 是否可能有漏网之鱼 |
+|---|---|---|
+| 事务性（营销模板） | `sendTransactionalEmail` L55-74 | 不会——抛 400 阻断 |
+| 事务性（事务性/无模板） | **完全不检查**（故意设计） | N/A——本就不应该拦 |
+| 活动（营销） | `buildRecipientWhereAsync` subscribed=true | 不会——根本不创建 Email |
+| 活动（事务性） | **完全不检查**（故意设计） | N/A——本就不应该拦 |
+| 工作流（营销） | `sendWorkflowEmail` L200-234 | 不会——创建 FAILED 不入队 |
+| 工作流（事务性） | **完全不检查**（故意设计） | N/A——本就不应该拦 |
+| 所有路径的 Worker | **不检查** subscribed | 仅当绕过所有 Service 层直接写 DB 时才可能 |
 
 ### 4.5 三条路径的订阅拦截汇总
 
 | 路径 | 拦截时机 | 拦截方式 | 退订 Contact 的结果 |
 |---|---|---|---|
-| 事务性 (API) | 营销模板检查 | `sendTransactionalEmail` L55-74 | 抛 400 错误 |
-| 事务性 (API) | 无模板/事务性模板 | **不拦截** | 正常发送 |
-| 活动 | 受众查询 | `buildRecipientWhereAsync` subscribed=true | 不创建 Email 记录 |
-| 活动 | Email 创建 | 不检查 | — |
-| 活动 | Worker | 不检查 | — |
-| 工作流 | 入口检查 | `sendWorkflowEmail` L200-234 | 创建 FAILED 记录，不入队 |
-| 工作流（事务性模板）| 不检查 | — | 正常发送 |
-| Worker 层 | — | **不检查** `subscribed` | — |
+| 事务性 (API) + 营销模板 | 入口 Service | `sendTransactionalEmail` L55-74 | 抛 400 错误，不创建记录 |
+| 事务性 (API) + 事务性/无模板 | 不拦截 | — | 正常发送（设计上允许） |
+| 活动（营销类） | 受众查询 | `buildRecipientWhereAsync` subscribed=true | 不创建 Email 记录 |
+| 活动（事务性类） | 不拦截 | — | 正常发送（设计上允许） |
+| 工作流 + 营销模板 | 入口 Service | `sendWorkflowEmail` L200-234 | 创建 FAILED 记录，不入队 |
+| 工作流 + 事务性模板 | 不拦截 | — | 正常发送（设计上允许） |
+| Worker 层（所有路径） | — | **不检查** `subscribed` | — |
 
 ---
 
@@ -429,8 +443,8 @@ Contact 的 `subscribed` 字段只在以下情况被设为 `false`：
 
 7. **活动受众筛选是实时查询而非快照**：[buildRecipientWhereAsync](file:///d:/fz/0601-2/solo-dogfeeding/code/15-plunk/apps/api/src/services/CampaignService.ts#L866-L906) 在每个 batch 处理时执行，`subscribed: true` 条件确保硬退/投诉被退订的 Contact 不会被后续批次选中。这是营销活动路径最核心的清洗机制——**退订即时生效**。
 
-8. **Worker 层不检查订阅状态**：[email-processor](file:///d:/fz/0601-2/solo-dogfeeding/code/15-plunk/apps/api/src/jobs/email-processor.ts#L73-L304) 只检查 `status === PENDING` 和项目是否 disabled，不检查 `contact.subscribed`。订阅拦截完全依赖上游（活动受众查询 / 工作流入口检查 / 事务性 API 模板检查）。如果绕过 Service 层直接写 DB，Worker 不会拦截。
+8. **Worker 层不检查订阅状态，不存在"兜底拦截"**：[email-processor](file:///d:/fz/0601-2/solo-dogfeeding/code/15-plunk/apps/api/src/jobs/email-processor.ts#L73-L304) 只检查 `status === PENDING`、项目 disabled、钓鱼内容，不检查 `contact.subscribed`。订阅拦截完全依赖各路径的入口 Service 层（活动受众查询 / 工作流入口检查 / 事务性 API 营销模板检查）。[EmailService.sendEmail](file:///d:/fz/0601-2/solo-dogfeeding/code/15-plunk/apps/api/src/services/EmailService.ts#L290-L456) 中的订阅检查是**死代码**，生产路径不调用此方法。
 
 9. **活动路径的退订拦截最彻底**：退订 Contact 根本不会产生 Email 记录，而工作流路径只是创建 FAILED 记录但不入队。两者都不会消耗 SES 发送配额，但活动路径更干净——不会在 Email 表中留下 FAILED 垃圾记录。
 
-10. **事务性邮件永远不受退订影响**：三条路径中的事务性类型（sourceType=TRANSACTIONAL）均跳过订阅检查。唯一的例外是事务性 API 使用了营销模板，此时入口层会抛 400。
+10. **事务性类型不受退订限制是故意设计，不是遗漏**：三条路径中，只要邮件类型判定为事务性（sourceType=TRANSACTIONAL 或 campaign.type=TRANSACTIONAL），就跳过所有订阅检查。唯一例外是事务性 API 使用了营销模板（此时入口层抛 400）。验证码、密码重置、订单通知等场景本就不应该因为退订而停止送达。
