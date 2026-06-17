@@ -147,48 +147,182 @@ AWS SES 本身会在收件方 MTA 返回 4xx（临时性拒绝）时自动重试
 
 ---
 
-## 四、清单清洗策略
+## 四、三条发送路径与队列关系
 
-### 4.1 自动退订
+Plunk 有三条独立的邮件发送入口，**全部汇聚到同一个 BullMQ `emailQueue`**，由同一个 [email-processor](file:///d:/fz/0601-2/solo-dogfeeding/code/15-plunk/apps/api/src/jobs/email-processor.ts#L73-L304) Worker 消费。区别在于入口层的订阅检查和受众筛选逻辑不同。
 
-以下两种情况会自动将 Contact 的 `subscribed` 设为 `false`：
+### 4.1 事务性邮件（API /v1/send）
 
-| 场景 | 触发位置 | 后续效果 |
-|------|---------|---------|
-| 硬退 | [Webhooks.ts L385-L388](file:///d:/fz/0601-2/solo-dogfeeding/code/15-plunk/apps/api/src/controllers/Webhooks.ts#L385-L388) | 后续营销邮件不再发送给该 Contact |
-| 投诉 | [Webhooks.ts L436-L439](file:///d:/fz/0601-2/solo-dogfeeding/code/15-plunk/apps/api/src/controllers/Webhooks.ts#L436-L439) | 同上 |
+**入口**：[Actions.send](file:///d:/fz/0601-2/solo-dogfeeding/code/15-plunk/apps/api/src/controllers/Actions.ts#L172-L348) → `EmailService.sendTransactionalEmail`
 
-软退**不触发退订**。
+**受众**：调用方在请求体中指定收件人，不经过任何受众筛选。
 
-### 4.2 发送前过滤
+**订阅检查**：
+- 仅在使用营销模板时拒绝退订 Contact（[L55-L74](file:///d:/fz/0601-2/solo-dogfeeding/code/15-plunk/apps/api/src/services/EmailService.ts#L55-L74)）：`template.type === 'MARKETING'` 且 `!contact.subscribed` → 抛 400
+- 事务性模板或无模板 → **不受订阅限制**，始终发送
+- **注意**：此处不会查询 Contact 的订阅状态来决定发送与否（除非用了营销模板），退订拦截靠 Worker 层兜底
 
-在邮件实际发送前，有多层订阅检查：
+**sourceType**：`EmailSourceType.TRANSACTIONAL`
 
-1. **EmailService.sendWorkflowEmail** — [L203-L234](file:///d:/fz/0601-2/solo-dogfeeding/code/15-plunk/apps/api/src/services/EmailService.ts#L203-L234)：营销邮件对已退订 Contact 直接创建 `FAILED` 记录（error='Contact is unsubscribed'），不入队
-2. **EmailService.sendEmail** — [L311-L326](file:///d:/fz/0601-2/solo-dogfeeding/code/15-plunk/apps/api/src/services/EmailService.ts#L311-L326)：再次检查 `contact.subscribed`，营销邮件跳过
-3. **EmailService.sendTransactionalEmail** — [L55-L75](file:///d:/fz/0601-2/solo-dogfeeding/code/15-plunk/apps/api/src/services/EmailService.ts#L55-L75)：营销模板发给退订 Contact 会抛 400 错误
+### 4.2 营销活动（Campaign）
 
-**事务性邮件（TRANSACTIONAL sourceType）不受订阅状态限制**，始终发送。
+**入口**：[CampaignService.send](file:///d:/fz/0601-2/solo-dogfeeding/code/15-plunk/apps/api/src/services/CampaignService.ts#L381-L454) → `startSending` → `processBatch`
 
-### 4.3 安全阈值与项目停用
+**完整发送链路**：
+
+```
+CampaignService.send()
+  ├─ scheduledFor? → QueueService.scheduleCampaign() → scheduledQueue → scheduled-processor → startSending()
+  └─ 立即发送 → startSending()
+                    └─ QueueService.queueCampaignBatch() → campaignQueue → campaign-processor
+                         └─ CampaignService.processBatch()  ← 逐批处理
+                              ├─ getRecipientsCursor()      ← 查 DB 筛选受众
+                              │    └─ buildRecipientWhereAsync() ← 构造 WHERE 子句
+                              ├─ 对每个 Contact: EmailService.sendCampaignEmail()
+                              │    └─ 创建 Email 记录(PENDING) → QueueService.queueEmail() → emailQueue
+                              └─ 有更多批次? → queueCampaignBatch(下一批)
+                                  无更多批次? → finalizeIfDone()
+```
+
+**受众筛选**（[buildRecipientWhereAsync](file:///d:/fz/0601-2/solo-dogfeeding/code/15-plunk/apps/api/src/services/CampaignService.ts#L866-L906)）：
+
+```ts
+const baseWhere = {
+  projectId,
+  // 营销类活动只选 subscribed: true 的 Contact
+  ...(campaign.type !== TemplateType.TRANSACTIONAL && { subscribed: true }),
+};
+```
+
+三种受众模式在此基础上叠加：
+
+| audienceType | 筛选方式 |
+|---|---|
+| `ALL` | 仅 `baseWhere`，即项目内所有已订阅 Contact |
+| `SEGMENT` | `baseWhere` + 静态分段的 `segmentMemberships`（exitedAt=null）/ 动态分段的 `SegmentService.buildConditionClause` |
+| `FILTERED` | `baseWhere` + `SegmentService.buildConditionClause(condition)` |
+
+**关键**：**受众查询在 processBatch 时实时执行**，不是在活动创建时快照。这意味着：
+- 活动发送期间如果某个 Contact 因硬退被退订，**后续批次查询时自动排除该 Contact**
+- 动态 Segment 的条件在每批查询时重新求值，联系人离开 Segment 后不会收到后续批次的邮件
+
+**退订后的拦截**（活动路径）：
+
+| 拦截层 | 位置 | 行为 |
+|---|---|---|
+| 受众查询 | [buildRecipientWhereAsync](file:///d:/fz/0601-2/solo-dogfeeding/code/15-plunk/apps/api/src/services/CampaignService.ts#L870-L874) `subscribed: true` | 退订 Contact 不出现在受众列表中，**根本不会为其创建 Email 记录** |
+| Email 创建 | `sendCampaignEmail` 无额外订阅检查 | — （已被受众查询过滤掉） |
+| Worker 层 | [email-processor L99](file:///d:/fz/0601-2/solo-dogfeeding/code/15-plunk/apps/api/src/jobs/email-processor.ts#L99) `status !== PENDING` | 不涉及订阅检查（但下面 4.4 有说明） |
+
+**sourceType**：营销活动默认 `CAMPAIGN`；若 `isTransactional=true` 或模板类型为 `TRANSACTIONAL` 则为 `TRANSACTIONAL`
+
+### 4.3 工作流邮件（Workflow）
+
+**入口**：[WorkflowExecutionService.executeSendEmail](file:///d:/fz/0601-2/solo-dogfeeding/code/15-plunk/apps/api/src/services/WorkflowExecutionService.ts#L526-L593) → `EmailService.sendWorkflowEmail`
+
+**受众**：工作流执行绑定的 Contact（由触发事件决定），不走受众筛选查询。
+
+**订阅检查**（[L200-L234](file:///d:/fz/0601-2/solo-dogfeeding/code/15-plunk/apps/api/src/services/EmailService.ts#L200-L234)）：
+- 营销工作流（sourceType ≠ TRANSACTIONAL）且无自定义收件人 → 查 `contact.subscribed`
+- `!contact.subscribed` → **静默跳过**：创建 `FAILED` 记录（error='Contact is unsubscribed from marketing emails'），**不入队**，工作流继续执行后续步骤
+- 事务性工作流 → 不检查订阅
+- 自定义收件人（`recipientEmail`） → 不检查订阅
+
+**sourceType**：默认 `WORKFLOW`；模板类型为 `TRANSACTIONAL` 时为 `TRANSACTIONAL`
+
+### 4.4 Worker 层的最终兜底拦截
+
+所有三条路径最终都汇入 [email-processor](file:///d:/fz/0601-2/solo-dogfeeding/code/15-plunk/apps/api/src/jobs/email-processor.ts#L73-L304)。Worker 在实际调 SES 前有一次兜底检查：
+
+```ts
+// L99
+if (email.status !== EmailStatus.PENDING) return;  // 幂等保护
+
+// 注意：email-processor 中没有直接检查 contact.subscribed
+// 但 EmailService.sendEmail 方法中有此检查（见下）
+```
+
+另外，[EmailService.sendEmail](file:///d:/fz/0601-2/solo-dogfeeding/code/15-plunk/apps/api/src/services/EmailService.ts#L290-L456)（同步发送路径，不经过队列）在 L311-L326 有订阅检查，但此方法**不是 email-processor 的调用路径**——processor 内联了发送逻辑。
+
+> ⚠️ 实际拦截情况：email-processor **没有** 再次检查 `contact.subscribed`。但因为：
+> - 活动路径：受众查询已排除退订 Contact，根本不会创建 Email 记录
+> - 工作流路径：`sendWorkflowEmail` 已拦截退订 Contact，不入队
+> - 事务性路径：设计上不应受订阅限制
+>
+> 所以理论上不会出现"退订 Contact 的 PENDING 邮件"进入 Worker。但如果通过 DB 直接插入 Email 记录（绕过 Service 层），则 Worker 不会拦截。
+
+### 4.5 三条路径的订阅拦截汇总
+
+| 路径 | 拦截时机 | 拦截方式 | 退订 Contact 的结果 |
+|---|---|---|---|
+| 事务性 (API) | 营销模板检查 | `sendTransactionalEmail` L55-74 | 抛 400 错误 |
+| 事务性 (API) | 无模板/事务性模板 | **不拦截** | 正常发送 |
+| 活动 | 受众查询 | `buildRecipientWhereAsync` subscribed=true | 不创建 Email 记录 |
+| 活动 | Email 创建 | 不检查 | — |
+| 活动 | Worker | 不检查 | — |
+| 工作流 | 入口检查 | `sendWorkflowEmail` L200-234 | 创建 FAILED 记录，不入队 |
+| 工作流（事务性模板）| 不检查 | — | 正常发送 |
+| Worker 层 | — | **不检查** `subscribed` | — |
+
+---
+
+## 五、清单清洗策略
+
+### 5.1 退订触发条件
+
+以下两种 SNS 事件会自动将 Contact 的 `subscribed` 设为 `false`：
+
+| 场景 | 触发位置 | 退订后效果 |
+|---|---|---|
+| 硬退 (Permanent Bounce) | [Webhooks.ts L385-L388](file:///d:/fz/0601-2/solo-dogfeeding/code/15-plunk/apps/api/src/controllers/Webhooks.ts#L385-L388) | 后续营销活动和工作流不再发送 |
+| 投诉 (Complaint) | [Webhooks.ts L436-L439](file:///d:/fz/0601-2/solo-dogfeeding/code/15-plunk/apps/api/src/controllers/Webhooks.ts#L436-L439) | 同上 |
+| 软退 (Transient Bounce) | — | **不退订** |
+| 未知退信类型 | [Webhooks.ts L409-L427](file:///d:/fz/0601-2/solo-dogfeeding/code/15-plunk/apps/api/src/controllers/Webhooks.ts#L409-L427) | **当作硬退 → 退订** |
+
+### 5.2 退订后对进行中活动的影响
+
+一个营销活动在发送过程中（状态 SENDING），按批（BATCH_SIZE=500）处理联系人。**每批的受众查询都是实时从 DB 读取 `subscribed: true` 的 Contact**。
+
+这意味着：如果第 1 批处理时 Contact A 收到了邮件，随后因硬退被退订（`subscribed → false`），那么到第 2 批查询时 Contact A 已经不在受众列表中——**退订是即时生效的**，不会等到活动结束。
+
+但已经发出的邮件不可撤回，该 Contact 仍会在 SES 层面收到那封邮件。
+
+### 5.3 退订后对进行中工作流的影响
+
+工作流的 SEND_EMAIL 步骤在执行时调用 `sendWorkflowEmail`，此时才检查 `contact.subscribed`。如果 Contact 在工作流执行中途被退订：
+- 下一个 SEND_EMAIL 步骤检查到 `!subscribed` → 创建 FAILED 记录（error='Contact is unsubscribed from marketing emails'），**工作流不中断**，继续执行后续步骤（如 DELAY、CONDITION 等）
+- 只有事务性工作流（模板类型为 TRANSACTIONAL）会忽略退订状态继续发送
+
+### 5.4 退订的不可逆性
+
+Contact 的 `subscribed` 字段只在以下情况被设为 `false`：
+1. 硬退/投诉 SNS Webhook（自动）
+2. 用户点击退订链接（Dashboard `/unsubscribe/:id`）
+3. API 调用 `POST /v1/track` 时显式传 `subscribed: false`
+
+重新订阅需要：
+1. 用户点击订阅链接（Dashboard `/subscribe/:id`）
+2. API 调用 `POST /v1/track` 时显式传 `subscribed: true`
+
+### 5.5 安全阈值与项目停用
 
 [SecurityService.ts L30-L69](file:///d:/fz/0601-2/solo-dogfeeding/code/15-plunk/apps/api/src/services/SecurityService.ts#L30-L69) 定义了双层阈值体系：
 
 **老项目（>30天）— 仅看比率**：
 
 | 指标 | 警告阈值 | 严重阈值 | 最低数量门槛 |
-|------|---------|---------|-------------|
+|---|---|---|---|
 | 7 天退信率 | 5% | 10% | 5/10 次 |
 | 全局退信率 | 4% | 8% | 5/10 次 |
 | 7 天投诉率 | 0.075% | 0.15% | 3/5 次 |
 | 全局投诉率 | 0.03% | 0.12% | 3/5 次 |
 
-> 仅硬退计入退信率。软退和 transiventBounce 不参与计算。
+> 仅硬退计入退信率。软退和 transientBounce 不参与计算。
 
 **新项目（≤30天）— 额外看绝对数量天花板**：
 
 | 指标 | 警告天花板 | 严重天花板 |
-|------|-----------|-----------|
+|---|---|---|
 | 24h 退信数 | 10 | 25 |
 | 7d 退信数 | 25 | 50 |
 | 24h 投诉数 | 3 | 7 |
@@ -203,74 +337,81 @@ AWS SES 本身会在收件方 MTA 返回 4xx（临时性拒绝）时自动重试
 
 ---
 
-## 五、完整状态流转图
+## 六、完整状态流转图
 
 ```
-                              ┌──────────────────────┐
-                              │     EmailService      │
-                              │  创建邮件 PENDING      │
-                              └──────────┬───────────┘
-                                         │
-                                         ▼
-                              ┌──────────────────────┐
-                              │  BullMQ emailQueue    │
-                              │  3次重试, 指数退避      │
-                              └──────────┬───────────┘
-                                         │
-                                         ▼
-                              ┌──────────────────────┐
-                              │  email-processor      │
-                              │  项目disabled?        │───YES──→ FAILED
-                              │  status≠PENDING?      │───YES──→ 跳过(return)
-                              └──────────┬───────────┘
-                                         │ NO
-                                         ▼
-                              ┌──────────────────────┐
-                              │  SENDING             │
-                              │  SES sendRawEmail()  │
-                              └──────────┬───────────┘
-                                   ┌─────┴─────┐
-                                   │           │
-                                成功          失败
-                                   │           │
-                                   ▼           ▼
-                              ┌─────────┐  ┌────────────────┐
-                              │  SENT   │  │  FAILED        │
-                              │ +msgId  │  │  +error        │
-                              └────┬────┘  │  throw→BullMQ  │
-                                   │       │  重试(但status  │
-                                   │       │  已非PENDING,   │
-                                   │       │  实际不会重发)   │
-                                   │       └────────────────┘
-                                   │
-                        ┌──────────┼──────────────────────┐
-                        │          │                      │
-                   SES SNS     SES SNS               SES SNS
-                   Delivery    Bounce               Complaint
-                        │          │                      │
-                        ▼     ┌────┴────┐                 ▼
-                   ┌─────────┐│         │          ┌───────────┐
-                   │DELIVERED││         │          │ COMPLAINED│
-                   └────┬────┘│         │          │ 退订Contact│
-                        │     │         │          │ 安全检查   │
-                   SES SNS   │         │          └───────────┘
-                   Open      │         │
-                        │    ▼         ▼
-                   ┌─────────┐  ┌──────────┐  ┌───────────────────┐
-                   │ OPENED  │  │ BOUNCED  │  │ (不更新状态)        │
-                   └────┬────┘  │ 退订Contact│ │ 仅记录事件          │
-                        │       │ 安全检查   │ │ bounceType=Transient│
-                   SES SNS     └──────────┘  │ 不退订Contact       │
-                   Click                    │ 不触发安全检查        │
-                        │                   └───────────────────────┘
-                   ┌──────────┐
-                   │ CLICKED  │              未知bounceType
-                   └──────────┘              → 当作硬退处理
+  三条发送入口                              全部汇入
+  ─────────────                            ────────
+
+  ┌─────────────────┐
+  │ API /v1/send     │
+  │ (事务性邮件)      │
+  │ sendTransactional│
+  └───────┬─────────┘
+          │ 营销模板→检查subscribed
+          │ 事务性模板→不检查
+          ▼
+  ┌─────────────────┐                    ┌──────────────────┐
+  │ CampaignService  │                    │  BullMQ emailQueue│
+  │ .processBatch()  │                    │  3次重试,指数退避   │
+  │ ┌───────────────┐│                    └────────┬─────────┘
+  │ │受众查询:       ││                             │
+  │ │subscribed=true ││                             ▼
+  │ │+ SEGMENT/FILTER││                    ┌──────────────────┐
+  │ └───────┬───────┘│                    │  email-processor   │
+  │ │sendCampaignEmail│                    │  status≠PENDING?  │──YES→ return
+  │ │创建Email(PENDING)│──────────────────→│  项目disabled?    │──YES→ FAILED
+  └───────┴─────────┘                     │  钓鱼检查?        │──YES→ FAILED+禁项目
+                                          └────────┬─────────┘
+  ┌─────────────────┐                              │
+  │ WorkflowExecution│                              ▼
+  │ .executeSendEmail│                    ┌──────────────────┐
+  │ sendWorkflowEmail│                    │  SENDING          │
+  │ ┌───────────────┐│                    │  SES sendRawEmail │
+  │ │营销→检查sub   ││                    └────────┬─────────┘
+  │ │事务性→不检查   ││                         ┌────┴────┐
+  │ │自定义收件→不查 ││                      成功        失败
+  │ │退订→FAILED不入队│                        │          │
+  │ └───────┬───────┘│                         ▼          ▼
+  └─────────┴─────────┘                    ┌────────┐  ┌──────────────┐
+          │                                │  SENT  │  │  FAILED      │
+          └───────────────────────────────→│ +msgId │  │  +error      │
+                                          └───┬────┘  │  throw→BullMQ│
+                                              │       │  重试(但status│
+                                              │       │  已非PENDING, │
+                                              │       │  实际不会重发)│
+                                              │       └──────────────┘
+                                              │
+                         ┌────────────────────┼──────────────────┐
+                         │                    │                  │
+                    SES SNS              SES SNS             SES SNS
+                    Delivery              Bounce            Complaint
+                         │                    │                  │
+                         ▼               ┌────┴────┐            ▼
+                    ┌──────────┐          │         │     ┌───────────┐
+                    │ DELIVERED│          │         │     │ COMPLAINED│
+                    └────┬─────┘          │         │     │ 退订Contact│
+                         │                ▼         ▼     │ 安全检查   │
+                    SES SNS       ┌──────────┐  ┌──────────────┐  └───────────┘
+                    Open          │ BOUNCED  │  │(不更新状态)    │
+                         │        │ 退订Contact│  │仅记录事件     │
+                         ▼        │ 安全检查  │  │bounceType=   │
+                    ┌──────────┐  └──────────┘  │Transient     │
+                    │ OPENED   │                │不退订Contact  │
+                    └────┬─────┘                │不触发安全检查  │
+                         │                      └──────────────┘
+                    SES SNS
+                    Click                 未知bounceType → 当作硬退
+                         │
+                         ▼
+                    ┌──────────┐
+                    │ CLICKED  │
+                    └──────────┘
 ```
 
 ---
 
-## 六、关键发现与注意点
+## 七、关键发现与注意点
 
 1. **软退不留痕**：软退（Transient Bounce）不改变 Email.status，不退订 Contact，不计入退信率。仅以 `email.bounce` 事件（含 `transientBounce: true`）留存记录。如果需要"软退 N 次后退订"策略，当前代码不支持。
 
@@ -285,3 +426,11 @@ AWS SES 本身会在收件方 MTA 返回 4xx（临时性拒绝）时自动重试
 5. **Campaign 终结条件**：[CampaignService.finalizeIfDone](file:///d:/fz/0601-2/solo-dogfeeding/code/15-plunk/apps/api/src/services/CampaignService.ts#L617-L663) 在每封邮件 SENT/FAILED 后检查是否所有邮件都已到达终态（`sentAt != null || status === FAILED`），满足则将 Campaign 从 SENDING 改为 SENT。退信（BOUNCED）不阻碍 Campaign 终结——因为 BOUNCED 的邮件必然已经 SENT 过。
 
 6. **SES 没有 Delay 事件**：AWS SES 的事件通知类型为 Send/Delivery/Bounce/Complaint/Open/Click/Rendering Failure，没有"延迟"类型。SES 在 MTA 返回 4xx 时自行重试，最终要么 Delivery 要么 Bounce（此时 bounceType=Transient）。
+
+7. **活动受众筛选是实时查询而非快照**：[buildRecipientWhereAsync](file:///d:/fz/0601-2/solo-dogfeeding/code/15-plunk/apps/api/src/services/CampaignService.ts#L866-L906) 在每个 batch 处理时执行，`subscribed: true` 条件确保硬退/投诉被退订的 Contact 不会被后续批次选中。这是营销活动路径最核心的清洗机制——**退订即时生效**。
+
+8. **Worker 层不检查订阅状态**：[email-processor](file:///d:/fz/0601-2/solo-dogfeeding/code/15-plunk/apps/api/src/jobs/email-processor.ts#L73-L304) 只检查 `status === PENDING` 和项目是否 disabled，不检查 `contact.subscribed`。订阅拦截完全依赖上游（活动受众查询 / 工作流入口检查 / 事务性 API 模板检查）。如果绕过 Service 层直接写 DB，Worker 不会拦截。
+
+9. **活动路径的退订拦截最彻底**：退订 Contact 根本不会产生 Email 记录，而工作流路径只是创建 FAILED 记录但不入队。两者都不会消耗 SES 发送配额，但活动路径更干净——不会在 Email 表中留下 FAILED 垃圾记录。
+
+10. **事务性邮件永远不受退订影响**：三条路径中的事务性类型（sourceType=TRANSACTIONAL）均跳过订阅检查。唯一的例外是事务性 API 使用了营销模板，此时入口层会抛 400。
