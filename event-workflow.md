@@ -704,7 +704,7 @@ catch (error) {
 
 | 路径 | 触发方 | 输出 | transition 选择逻辑 |
 |------|--------|------|---------------------|
-| **事件到达** | `handleEvent()` | `{ eventReceived: true, eventName, eventData, receivedAt }` | 走 `processNextSteps()`，stepResult 无 `branch` 字段，匹配不到 `condition.branch`，走**无条件 transition** 或 `evaluateTransitionCondition`（未实现） |
+| **事件到达** | `handleEvent()` | StepExecution.output 写入 `{ eventName, eventData, receivedAt }`，传给 `processNextSteps()` 的 stepResult 是 `{ eventReceived: true }` | stepResult 无 `branch` 字段，匹配不到 `condition.branch`，走**无条件 transition** 或 `evaluateTransitionCondition`（当前恒返回 false） |
 | **超时到期** | `processTimeout()` | `{ timedOut: true, eventName }` | 在 processTimeout 内部**直接匹配** transition：找 `condition.branch === 'timeout'` 或 `condition.fallback === true`；没有则走**第一条** transition |
 
 **并发竞态分析**：
