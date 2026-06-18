@@ -11,7 +11,7 @@
 全仓搜索 `EmailService.sendEmail(` 的调用点，结果只有 [apps/api/src/services/\_\_tests\_\_/EmailService.test.ts](apps/api/src/services/__tests__/EmailService.test.ts)（L354/L372/L398/L422/L703）。**生产代码中没有任何地方调用它**。
 
 - `EmailService.sendEmail` 定义在 [apps/api/src/services/EmailService.ts#L290](apps/api/src/services/EmailService.ts#L290)。它是一个"自包含的同步发送方法"：内含退订拦截（L311）、发件域校验（L331）、模板渲染、`sendRawEmail`、落 `SENT`、`EventService.trackEvent`。
-- 生产发送路径不经过它。邮件先由入口方法（`sendTransactionalEmail`/`sendCampaignEmail`/`sendWorkflowEmail`）写成 `status=PENDING` 的 `Email` 记录入队，再由 [apps/api/src/jobs/email-processor.ts](apps/api/src/jobs/email-processor.ts) 的 worker 消费、内联完成渲染与发送。worker **不调用** `EmailService.sendEmail`，二者各自实现了一套发送逻辑。
+- 生产发送路径不经过它。邮件先由入口方法（`sendTransactionalEmail`/`sendCampaignEmail`/`sendWorkflowEmail`）处理：**正常情况下写一条 `status=PENDING` 的 `Email` 记录并 `queueEmail` 入队**，再由 [apps/api/src/jobs/email-processor.ts](apps/api/src/jobs/email-processor.ts) 的 worker 消费、内联完成渲染与发送。但有**一个例外**：`sendWorkflowEmail` 对未订阅的营销联系人会写一条 `status=FAILED` 的占位记录后**直接 return**——不写 `PENDING`、不计费、不入队（见 §3.2⑤b）。worker **不调用** `EmailService.sendEmail`，二者各自实现了一套发送逻辑。
 
 因此下文凡涉及"发送时"的闸门，必须区分"入口/收件人筛选阶段"与"worker 消费阶段"，不能笼统说"发送时拦截"。
 
@@ -27,14 +27,14 @@
  └──────────────────────────────────────────────────────────────────┘
                               │创建时保证 from 合法
                               ▼
- 入口（写 Email 记录 PENDING + queueEmail）          收件人筛选（退订拦截③）
+ 入口（正常：PENDING + queueEmail；workflow 未订阅营销：FAILED 占位不入队）   收件人筛选（退订拦截③）
  ┌───────────────────────────────────────────┐     ┌──────────────┐
  │ Actions.send(/v1/send)  → sendTransactionalEmail│ campaign:    │
  │ SMTP Relay → /v1/send   → sendTransactionalEmail│ buildRecipient│
  │ 平台通知 packages/email → /v1/send              │ WhereAsync   │
  │ 营销广播 CampaignService.send → sendCampaignEmail│ subscribed:true│
  │ 工作流 SEND_EMAIL step → sendWorkflowEmail       └──────────────┘
- │   (recipient=CUSTOM 时绕过退订④)                                  │
+ │   (recipient=CUSTOM 时绕过退订⑤b；未订阅营销写 FAILED 占位不入队⑤b)        │
  └───────────────────────────┬───────────────┘
                              ▼
        入口各自的退订拦截⑤/计费⑥先后顺序（三个入口不一致，见 §3）
@@ -58,6 +58,8 @@
 
 **worker 不做**：退订拦截、发件域校验——前者入口层/筛选层已做，后者资源创建/更新时已保证。
 
+> ⚠️ "入口写 PENDING 入队"有一个例外：`sendWorkflowEmail` 对未订阅的营销联系人走 `if (!contact?.subscribed)` 分支，`return await prisma.email.create({... status: FAILED ...})` 后直接返回（[apps/api/src/services/EmailService.ts#L209-L234](apps/api/src/services/EmailService.ts#L209-L234)）——**不写 PENDING、不调用 checkLimit、不 incrementUsage、不 queueEmail**。这条 FAILED 占位记录留在库里作为"已跳过"的审计痕迹，但永远不会进 `email` 队列、不会被 worker 消费。详见 §3.2⑤b。
+
 ---
 
 ## 2. 选路算法（Selection / Routing）
@@ -70,7 +72,15 @@
 | 营销广播分批 | `sendCampaignEmail` | `CAMPAIGN`（模板 TRANSACTIONAL 时升级） | [apps/api/src/services/EmailService.ts#L119](apps/api/src/services/EmailService.ts#L119) |
 | 自动化工作流 SEND_EMAIL step | `sendWorkflowEmail` | `WORKFLOW`（模板 TRANSACTIONAL 时升级；CUSTOM 收件人绕过退订⑤b） | [apps/api/src/services/EmailService.ts#L183](apps/api/src/services/EmailService.ts#L183) |
 
-三个入口最终都写 `Email(status=PENDING)` 后 `QueueService.queueEmail`。
+"归一"指：无论哪条触发路径，最终都由 `EmailService` 的某个入口方法处理，且正常发送的邮件都汇入**同一个** `email` 队列（而非每条路径各自一个队列）。但**不是每个入口调用都一定写 PENDING 并入队**——三条入口在"未订阅营销联系人"上的行为分岔：
+
+| 入口方法 | 未订阅营销联系人时的处理 | 是否写 PENDING | 是否入队 |
+| --- | --- | --- | --- |
+| `sendTransactionalEmail` | throw 400（不写记录） | ❌ | ❌ |
+| `sendCampaignEmail` | 不在此处判断（信任③的 SQL 预筛选，未订阅者根本到不了这里） | — | — |
+| `sendWorkflowEmail` | 写 `status=FAILED` 占位后**直接 return** | ❌（写 FAILED） | ❌ |
+
+因此准确说法是：**正常路径下**三个入口写 `Email(status=PENDING)` 后 `QueueService.queueEmail`；`sendWorkflowEmail` 的退订占位分支是例外——它写 `FAILED` 占位后 `return`，既不写 `PENDING` 也不入队（见 §3.2⑤b）。
 
 ### 2.2 队列内选路：BullMQ `priority`（唯一的"选路算法"）
 
@@ -266,9 +276,10 @@ email     ─(worker)─► AWS SES ─► SNS 回执 ─► /webhooks/sns（退
 
 ## 7. 一句话总结（v3 修正版）
 
-- **选路** = 多入口归一进单 `email` 队列 + BullMQ `priority` 按来源类型排序 + 出站仅 SES（按 tracking 选 Configuration Set）。
+- **选路** = 多入口归一到单一 `email` 队列体系（正常邮件写 PENDING 入队）+ BullMQ `priority` 按来源类型排序 + 出站仅 SES（按 tracking 选 Configuration Set）。
+- **入口归一的例外**：`sendWorkflowEmail` 对未订阅营销联系人写 `FAILED` 占位后直接 return，**不写 PENDING、不计费、不入队**；transactional 未订阅则 throw 400 不写记录；campaign 未订阅者在 SQL 预筛选阶段就被剔除，到不了入口。
 - **发件域校验**不是发送时做：campaign/template **创建/更新时 controller 层**校验（①②），只有 `/v1/send` 直发送（④）和 campaign 测试邮件（⑨）才在发送前补做；**正式广播链路信任创建期校验，不复检**。
-- **退订拦截三个入口不一致**：campaign 走 SQL WHERE 预筛选（③），transactional 先退订后计费（抛 400），workflow 先退订写 FAILED 占位后计费（占位不计费）+ **CUSTOM 收件人条件 `!params.recipientEmail` 绕过退订**；sendCampaignEmail 信任上游筛选，不做二次检查。
+- **退订拦截三个入口不一致**：campaign 走 SQL WHERE 预筛选（③），transactional 先退订后计费（抛 400），workflow 先退订写 FAILED 占位后 return（占位不计费不入队）+ **CUSTOM 收件人条件 `!params.recipientEmail` 绕过退订**；sendCampaignEmail 信任上游筛选，不做二次检查。
 - **Worker 职责**（与 sendEmail 互补）= disabled 拦截 + 钓鱼采样 + 渲染发送 + 计量 + campaign 收尾 + 重试；**信任**入口层/创建期已做完退订与域校验。
 - `EmailService.sendEmail` 是与 worker 并存的另一套发送逻辑，但**仅测试调用**，不参与生产发送。
 - **降级无二级 Provider**，失败只靠 BullMQ 3 次重试；项目拉黑时跨队列级联清理。
