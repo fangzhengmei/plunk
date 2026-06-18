@@ -1,101 +1,156 @@
 # Event → Workflow 完整执行脉络
 
 本文档基于代码梳理事件从入站到触发、规则匹配、节点调度、失败恢复的完整流程。
+所有路径均为仓库相对路径（基于 `apps/api` 等模块根）。
 
 ---
 
 ## 1. 总体架构图
 
 ```
-                    ┌──────────────────────────────────────────────┐
-                    │              事件入站入口                      │
-                    ├──────────────────────────────────────────────┤
-                    │  • /v1/track        (Actions API, 公钥)       │
-                    │  • /events/track    (Events API, JWT)        │
-                    │  • /webhooks/sns    (AWS SES 邮件回调)        │
-                    │  • /webhooks/incoming/stripe (支付回调)       │
-                    │  • 内部服务调用     (e.g. UPDATE_CONTACT)    │
-                    └────────────────────┬─────────────────────────┘
-                                         │
-                                         ▼
-                    ┌──────────────────────────────────────────────┐
-                    │         EventService.trackEvent()             │
-                    │  1. 写入 Event 表（持久化）                    │
-                    │  2. triggerWorkflows() → 触发新 workflow      │
-                    │  3. handleEvent()      → 唤醒 WAIT_FOR_EVENT  │
-                    └─────────┬───────────────────┬────────────────┘
-                              │                   │
-                              ▼                   ▼
-              ┌───────────────────────┐   ┌──────────────────────────┐
-              │ triggerWorkflows()    │   │ handleEvent()            │
-              │ • Redis 缓存工作流     │   │ • 查找 WAITING 的步骤     │
-              │ • 匹配 eventName       │   │ • 匹配 eventName         │
-              │ • 检查 re-entry 规则   │   │ • 取消超时 job           │
-              │ • 创建 Execution       │   │ • 继续下一步             │
-              └───────────┬───────────┘   └────────────┬─────────────┘
-                          │                            │
-                          ▼                            ▼
-              ┌─────────────────────────────────────────────────────┐
-              │     WorkflowExecutionService.processStepExecution()  │
-              │  • 状态校验 (RUNNING/WAITING, project/workflow)      │
-              │  • 创建/更新 StepExecution                           │
-              │  • executeStep() → 按 step.type 分派                │
-              │  • processNextSteps() → 按 transition 推进           │
-              └──────────────────────┬──────────────────────────────┘
-                                     │
-                    ┌────────────────┴────────────────┐
-                    │         步骤类型分派              │
-                    ├──────────────────────────────────┤
-                    │ TRIGGER        │ 入口占位        │
-                    │ SEND_EMAIL     │ 渲染+发邮件     │
-                    │ DELAY          │ 入队 BullMQ     │
-                    │ WAIT_FOR_EVENT │ 等待+超时       │
-                    │ CONDITION      │ 条件分支        │
-                    │ EXIT           │ 终止工作流      │
-                    │ WEBHOOK        │ SSRF-safe 调用  │
-                    │ UPDATE_CONTACT │ 更新联系人      │
-                    └──────────────────────────────────┘
+   ┌─────────────────────────────────────────────────────────────────────┐
+   │                  会触发 workflow 的事件源                            │
+   ├────────────────────────────┬────────────────────────────────────────┤
+   │   外部 HTTP 入口            │   内部服务触发                         │
+   │   ───────────────          │   ──────────────                       │
+   │   • POST /v1/track         │   • ContactService (订阅状态变化)       │
+   │     (Actions, 公钥)        │     → contact.subscribed/.unsubscribed  │
+   │   • POST /events/track     │   • EmailService.sendEmail             │
+   │     (Events, JWT)          │     → email.sent                       │
+   │   • POST /webhooks/sns     │   • email-processor.ts (BullMQ worker)│
+   │     (SES 回调)             │     → email.sent                       │
+   │                            │   • EmailService.handleWebhookEvent    │
+   │                            │     → contact.unsubscribed             │
+   │                            │   • SegmentService (成员变动)           │
+   │                            │     → segment.{slug}.entry/.exit       │
+   │                            │   • WorkflowExecutionService           │
+   │                            │     .executeUpdateContact              │
+   └────────────┬───────────────┴───────────────────┬───────────────────┘
+                │                                    │
+                ▼                                    ▼
+       ┌──────────────────────────────────────────────────────────┐
+       │             EventService.trackEvent()                    │
+       │  1. 持久化 Event 记录（写库）                              │
+       │  2. triggerWorkflows() → 启动监听该事件的新 workflow      │
+       │  3. handleEvent()      → 唤醒 WAIT_FOR_EVENT 等待者       │
+       └─────────┬──────────────────────────────────┬──────────────┘
+                 │                                  │
+                 ▼                                  ▼
+   ┌───────────────────────────┐    ┌──────────────────────────────────┐
+   │ triggerWorkflows()         │    │ handleEvent()                    │
+   │ • Redis 缓存 enabled 流    │    │ • 查询所有 WAITING 的            │
+   │ • 匹配 triggerConfig.      │    │   WAIT_FOR_EVENT step executions │
+   │   eventName === eventName  │    │ • 匹配 step.config.eventName      │
+   │ • 检查 re-entry 规则       │    │ • 取消超时 job                   │
+   │ • 创建 WorkflowExecution   │    │ • processNextSteps() 继续         │
+   └──────────┬────────────────┘    └─────────────┬────────────────────┘
+              │                                    │
+              ▼                                    ▼
+   ┌──────────────────────────────────────────────────────────────────┐
+   │       WorkflowExecutionService.processStepExecution()              │
+   │  • 状态校验 (RUNNING/WAITING, project.disabled, workflow.enabled)  │
+   │  • 创建/复用 StepExecution 记录                                    │
+   │  • executeStep() 按 step.type 分派到 8 种处理器                    │
+   │  • processNextSteps() 按 transition 推进                          │
+   └─────────────────────────┬────────────────────────────────────────┘
+                             │
+              ┌──────────────┴───────────────────┐
+              │      8 种 step 类型分派           │
+              ├──────────────────────────────────┤
+              │ TRIGGER        │ 入口占位        │
+              │ SEND_EMAIL     │ 渲染+发邮件     │
+              │ DELAY          │ 入队 BullMQ     │
+              │ WAIT_FOR_EVENT │ 等待+超时       │
+              │ CONDITION      │ 条件分支        │
+              │ EXIT           │ 终止工作流      │
+              │ WEBHOOK        │ SSRF-safe 调用  │
+              │ UPDATE_CONTACT │ 更新联系人      │
+              └──────────────────────────────────┘
+
+
+   ┌──────────────────────────────────────────────────────────────────────┐
+   │   不触发 workflow 的入口（仅内部账务/状态更新）                       │
+   ├──────────────────────────────────────────────────────────────────────┤
+   │   • POST /webhooks/incoming/stripe  (Webhooks.receiveStripeWebhook)  │
+   │     → 仅更新 Project.customer/subscription/disabled 状态              │
+   │     → 发 Ntfy 通知，发邮件给项目成员                                   │
+   │     → 全程不调用 EventService.trackEvent，不进入事件系统                │
+   └──────────────────────────────────────────────────────────────────────┘
 ```
 
 ---
 
-## 2. 事件入站（Event Ingestion）
+## 2. 事件入站入口：会启动 workflow 的路径
 
-事件有 5 个主要入站渠道，最终都汇聚到 `EventService.trackEvent()`。
+所有真正进入事件系统的入口都最终汇聚到 `EventService.trackEvent()`。
 
-### 2.1 入站渠道对比
+### 2.1 外部 HTTP 入口
 
-| 渠道 | 文件 | 鉴权 | 典型事件 |
-|------|------|------|----------|
-| `/v1/track` | [Actions.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/34-plunk/apps/api/src/controllers/Actions.ts#L49-L102) | Public API Key | 自定义业务事件（user.signup, purchase.completed 等） |
-| `/events/track` | [Events.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/34-plunk/apps/api/src/controllers/Events.ts#L14-L28) | JWT + 邮箱验证 | 后台手动追踪事件 |
-| `/webhooks/sns` | [Webhooks.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/34-plunk/apps/api/src/controllers/Webhooks.ts#L36-L477) | SNS 签名验证 | email.sent, email.delivered, email.opened, email.clicked, email.bounce, email.complaint, email.received |
-| `/webhooks/incoming/stripe` | [Webhooks.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/34-plunk/apps/api/src/controllers/Webhooks.ts#L483-L789) | Stripe 签名 | 支付相关（不触发 workflow，仅内部账务） |
-| 内部服务调用 | [WorkflowExecutionService.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/34-plunk/apps/api/src/services/WorkflowExecutionService.ts#L1070-L1076) | 内部调用 | contact.subscribed / contact.unsubscribed（UPDATE_CONTACT 步骤触发） |
+| HTTP 路径 | Controller 方法 | 鉴权 | 触发的事件名 |
+|-----------|-----------------|------|--------------|
+| `POST /v1/track` | [Actions.track](apps/api/src/controllers/Actions.ts#L49-L102) | Public API Key | 业务方自定义事件（如 `user.signup`, `purchase.completed`） |
+| `POST /events/track` | [Events.track](apps/api/src/controllers/Events.ts#L14-L28) | JWT + 邮箱验证 | 后台手动追踪，事件名由请求体 `name` 字段指定 |
+| `POST /webhooks/sns` | [Webhooks.receiveSNSWebhook](apps/api/src/controllers/Webhooks.ts#L36-L477) | SNS 签名验证 | `email.delivery` / `email.open` / `email.click` / `email.bounce` / `email.complaint` / `email.received` |
 
-### 2.2 `/v1/track` 公共 API 流程
+#### 2.1.1 `/v1/track` 公共 API 流程
 
-[Actions.track()](file:///d:/fz/0601-2/solo-dogfeeding/code/34-plunk/apps/api/src/controllers/Actions.ts#L49-L102) 是业务方最常用的入口：
+[Actions.track()](apps/api/src/controllers/Actions.ts#L49-L102) 是业务方最常用入口：
 
-1. **Zod 校验** 请求体（event, email, data 等）
-2. **保留事件检查**：`EventService.isReservedEvent()` 阻止手动追踪 `email.*`、`contact.*`、`segment.*.entry/exit`
-3. **联系人 upsert**：`ContactService.upsert()` - 仅将 persistent=true 的字段写入 Contact.data
-4. **事件追踪**：`EventService.trackEvent()` - 将完整 data（含 non-persistent）传入作为 workflow context
+1. **Zod 校验**请求体（event, email, data 等），见 [ActionSchemas.track](packages/shared/src/schemas/index.ts#L453-L459)
+2. **保留事件检查**：[EventService.isReservedEvent()](apps/api/src/services/EventService.ts#L327-L345) 阻止手动追踪 `email.*`、`contact.subscribed`、`contact.unsubscribed`、`segment.*.entry/.exit`
+3. **联系人 upsert**：[ContactService.upsert()](apps/api/src/services/ContactService.ts#L273-L339) — 仅将 persistent=true 的字段写入 `Contact.data`
+4. **事件追踪**：[EventService.trackEvent()](apps/api/src/services/EventService.ts#L22-L47) — 完整 data（含 non-persistent）作为 workflow context
 
-### 2.3 SNS Webhook 流程
+#### 2.1.2 SNS Webhook 流程
 
-[Webhooks.receiveSNSWebhook()](file:///d:/fz/0601-2/solo-dogfeeding/code/34-plunk/apps/api/src/controllers/Webhooks.ts#L36-L477) 处理两类 SES 通知：
+[Webhooks.receiveSNSWebhook()](apps/api/src/controllers/Webhooks.ts#L36-L477) 处理两类 SES 通知：
 
-- **SubscriptionConfirmation**：自动请求 SubscribeURL 确认订阅（有 SSRF 防护，仅允许 AWS SNS 域名）
+- **SubscriptionConfirmation**：仅校验 SubscribeURL 域名（限制 `sns.<region>.amazonaws.{com|eu}`），fetch 确认订阅，**不产生事件**
 - **Notification**：
-  - 入站邮件（notificationType === 'Received'）：逐 recipient 查找已验证 domain → upsert contact → 创建 Email 记录 → 触发 `email.received` 事件
-  - 出站邮件事件（Delivery/Open/Click/Bounce/Complaint）：按 SES messageId 查 Email → 更新 Email 状态 → 触发 `email.xxx` 事件
+  - **入站邮件**（`body.notificationType === 'Received'`）：逐 recipient 查已验证 domain → upsert contact → 创建 Email 记录 → [EventService.trackEvent()](apps/api/src/controllers/Webhooks.ts#L265-L271) 触发 `email.received` 事件
+  - **出站邮件事件**（Delivery/Open/Click/Bounce/Complaint）：按 SES messageId 查 Email → 更新 Email 状态 → [EventService.trackEvent()](apps/api/src/controllers/Webhooks.ts#L461) 触发 `email.{eventType.toLowerCase()}` 事件
+  - Bounce/Complaint 还会**额外**修改 Contact.subscribed = false，但**不**直接调用 trackEvent 触发 `contact.unsubscribed`（仅触发 `email.bounce` / `email.complaint` 事件）
+
+### 2.2 内部服务触发的事件
+
+这些不是 HTTP 入口，而是业务流程中由其他服务调用 `EventService.trackEvent()` 触发的事件：
+
+| 服务 / 文件 | 触发条件 | 事件名 |
+|------------|---------|--------|
+| [ContactService.update](apps/api/src/services/ContactService.ts#L228-L235) | 联系人订阅状态从 false→true 或 true→false | `contact.subscribed` / `contact.unsubscribed` |
+| [ContactService.upsert](apps/api/src/services/ContactService.ts#L304-L311) | 同上（upsert 路径） | `contact.subscribed` / `contact.unsubscribed` |
+| [ContactService.subscribe / unsubscribe](apps/api/src/services/ContactService.ts#L432-L452) | 单个订阅/退订 | `contact.subscribed` / `contact.unsubscribed` |
+| [ContactService.trackEventsSequentially](apps/api/src/services/ContactService.ts#L864-L885) | 批量订阅/退订（bulkSubscribe/bulkUnsubscribe 调用） | `contact.subscribed` / `contact.unsubscribed` |
+| [EmailService.sendEmail](apps/api/src/services/EmailService.ts#L290-L441) | 服务内直接发送邮件成功后 | `email.sent` |
+| [email-processor.ts](apps/api/src/jobs/email-processor.ts#L250-L261) | BullMQ worker 成功发送邮件后 | `email.sent` |
+| [EmailService.handleWebhookEvent](apps/api/src/services/EmailService.ts#L462-L531) | bounce/complaint 时修改订阅状态 | `contact.unsubscribed`（含 reason 字段） |
+| [SegmentService](apps/api/src/services/SegmentService.ts#L569-L614) | 动态 segment 重算成员，contact 进入/离开 segment | `segment.{slug}.entry` / `segment.{slug}.exit` |
+| [WorkflowExecutionService.executeUpdateContact](apps/api/src/services/WorkflowExecutionService.ts#L1069-L1076) | workflow 内 UPDATE_CONTACT 步骤改变订阅状态 | `contact.subscribed` / `contact.unsubscribed` |
+
+> ⚠️ **递归风险点**：`UPDATE_CONTACT` 步骤触发 `contact.subscribed` 事件，该事件可能又触发监听该事件的其他 workflow，形成链式调用。`ContactService` 触发的 `contact.subscribed` 同理可能触发新的 workflow execution。
+
+### 2.3 不触发 workflow 的入口
+
+**`POST /webhooks/incoming/stripe`**（[Webhooks.receiveStripeWebhook](apps/api/src/controllers/Webhooks.ts#L483-L789)）是计费回调，**完全不进入事件系统**：
+
+| Stripe 事件类型 | 处理行为 |
+|----------------|---------|
+| `checkout.session.completed` | 更新 Project.customer / subscription；refund 卡验证费用；可选应用 SWITCH promo |
+| `invoice.paid` | 若 project 因 `PAYMENT_FAILED` 被禁用则重新启用 |
+| `invoice.payment_failed` | （非首次订阅时）禁用 project，置 `disabledReason = PAYMENT_FAILED`，发邮件通知成员 |
+| `customer.subscription.deleted` | 清空 Project.subscription |
+| `customer.subscription.updated` | 仅记录日志 + Ntfy 通知 |
+| `radar.early_fraud_warning.created` | refund charge，将 card fingerprint/email 加入 Stripe Radar blocklist |
+
+整个过程**不调用 `EventService.trackEvent()`**，不写入 Event 表，不会启动或唤醒任何 workflow。它的副作用仅限于 `Project` 表的状态字段和外部 Stripe API。
+
+> 注意：`EmailService.handleWebhookEvent()` 末尾会直接 `prisma.event.create()` 写入 `email.{eventType}`，但没有调用 `EventService.trackEvent()`，因此这条直接写库路径不会启动或唤醒 workflow；真正能触发 workflow 的邮件状态事件来自 SNS webhook 的 `EventService.trackEvent()` 调用。
 
 ---
 
 ## 3. 事件处理核心：EventService.trackEvent()
 
-[EventService.trackEvent()](file:///d:/fz/0601-2/solo-dogfeeding/code/34-plunk/apps/api/src/services/EventService.ts#L22-L47) 是所有事件的汇聚点，执行三件事：
+[EventService.trackEvent()](apps/api/src/services/EventService.ts#L22-L47) 是所有事件源的汇聚点，执行三件事：
 
 ```typescript
 public static async trackEvent(
@@ -108,7 +163,7 @@ public static async trackEvent(
   // 1. 持久化事件
   const event = await prisma.event.create({ ... });
 
-  // 2. 触发监听该事件的新 workflow
+  // 2. 触发监听该事件的新 workflow（启动新 execution）
   await this.triggerWorkflows(projectId, eventName, contactId, data);
 
   // 3. 唤醒正在 WAIT_FOR_EVENT 的已运行 workflow
@@ -120,21 +175,21 @@ public static async trackEvent(
 
 ### 3.1 数据模型：Event 表
 
-[schema.prisma](file:///d:/fz/0601-2/solo-dogfeeding/code/34-plunk/packages/db/prisma/schema.prisma#L600-L630)
+[schema.prisma](packages/db/prisma/schema.prisma#L600-L630)
 
 | 字段 | 说明 |
 |------|------|
-| `name` | 事件名，如 "email.opened" |
+| `name` | 事件名，如 `email.opened`、`user.signup` |
 | `data` | JSON 事件载荷，带 GIN 索引 |
 | `projectId` | 所属项目 |
-| `contactId` | 关联联系人（可选） |
-| `emailId` | 关联邮件（可选） |
+| `contactId` | 关联联系人（可选，project-level 事件为 null） |
+| `emailId` | 关联邮件（仅 `email.*` 系列事件） |
 
 ---
 
 ## 4. 规则匹配：triggerWorkflows()
 
-[EventService.triggerWorkflows()](file:///d:/fz/0601-2/solo-dogfeeding/code/34-plunk/apps/api/src/services/EventService.ts#L351-L408) 负责找出哪些 workflow 需要被这个事件新启动。
+[EventService.triggerWorkflows()](apps/api/src/services/EventService.ts#L351-L408) 负责找出哪些 workflow 需要被这个事件**新启动**。
 
 ### 4.1 工作流缓存策略
 
@@ -158,21 +213,26 @@ if (!workflows) {
 }
 ```
 
-**缓存失效时机**：workflow 被创建/更新/删除/启用/禁用时，`EventService.invalidateWorkflowCache()` 会 `redis.del(cacheKey)`。见 [keys.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/34-plunk/apps/api/src/services/keys.ts#L71-L75)。
+**缓存失效时机**：workflow 被创建/更新/删除/启用/禁用时，[EventService.invalidateWorkflowCache()](apps/api/src/services/EventService.ts#L53-L60) 会 `redis.del(cacheKey)`。Key 模板见 [keys.ts](apps/api/src/services/keys.ts#L71-L75)。
 
 ### 4.2 事件名匹配 + 重入检查
 
 ```typescript
 for (const workflow of workflows) {
-  if (workflow.triggerConfig?.eventName === eventName) {  // 规则匹配
+  if (workflow.triggerConfig?.eventName === eventName) {  // 精确字符串匹配
     if (contactId) {
       await this.startWorkflowForContact(workflow.id, contactId, data);
+    } else {
+      // project-level 事件无 contactId，不会启动 workflow
+      signale.info(`[EVENT] Event ${eventName} triggered workflow ${workflow.id}, but no contact specified`);
     }
   }
 }
 ```
 
-[startWorkflowForContact()](file:///d:/fz/0601-2/solo-dogfeeding/code/34-plunk/apps/api/src/services/EventService.ts#L413-L489) 中的重入规则：
+> ⚠️ **关键限制**：即便 workflow 的 trigger 监听了某事件，若事件没有 `contactId`（如纯 project-level 事件），workflow 也**不会启动**。这是当前实现的一个隐含约束。
+
+[startWorkflowForContact()](apps/api/src/services/EventService.ts#L413-L489) 中的重入规则：
 
 | `allowReentry` | 检查逻辑 |
 |---|---|
@@ -184,24 +244,24 @@ for (const workflow of workflows) {
 通过检查后：
 
 1. 创建 `WorkflowExecution` 记录：`status=RUNNING`, `currentStepId=triggerStep.id`, `context=event.data`
-2. 同步调用 `WorkflowExecutionService.processStepExecution(execution.id, triggerStep.id)` 开始执行
+2. 同步调用 [WorkflowExecutionService.processStepExecution()](apps/api/src/services/WorkflowExecutionService.ts#L47-L299) 开始执行
 
 ---
 
 ## 5. 节点调度：processStepExecution()
 
-[WorkflowExecutionService.processStepExecution()](file:///d:/fz/0601-2/solo-dogfeeding/code/34-plunk/apps/api/src/services/WorkflowExecutionService.ts#L47-L299) 是 workflow 执行引擎的核心。
+[WorkflowExecutionService.processStepExecution()](apps/api/src/services/WorkflowExecutionService.ts#L47-L299) 是 workflow 执行引擎的核心。
 
 ### 5.1 前置校验（按顺序）
 
 | 检查项 | 行为 | 代码行 |
 |--------|------|--------|
-| Execution 是否存在 | 不存在抛 404 | [L50-L76](file:///d:/fz/0601-2/solo-dogfeeding/code/34-plunk/apps/api/src/services/WorkflowExecutionService.ts#L50-L76) |
-| Execution 状态 | 非 RUNNING 且非 WAITING → 直接 return | [L80-L89](file:///d:/fz/0601-2/solo-dogfeeding/code/34-plunk/apps/api/src/services/WorkflowExecutionService.ts#L80-L89) |
-| Project 是否 disabled | 是 → 标记 CANCELLED + exitReason | [L91-L105](file:///d:/fz/0601-2/solo-dogfeeding/code/34-plunk/apps/api/src/services/WorkflowExecutionService.ts#L91-L105) |
-| Workflow 是否 enabled | 禁用时**允许已开始的执行继续**（只阻止新 execution） | [L111-L116](file:///d:/fz/0601-2/solo-dogfeeding/code/34-plunk/apps/api/src/services/WorkflowExecutionService.ts#L111-L116) |
+| Execution 是否存在 | 不存在抛 404 | [L50-L76](apps/api/src/services/WorkflowExecutionService.ts#L50-L76) |
+| Execution 状态 | 非 RUNNING 且非 WAITING → 直接 return | [L80-L89](apps/api/src/services/WorkflowExecutionService.ts#L80-L89) |
+| Project 是否 disabled | 是 → 标记 CANCELLED + exitReason | [L91-L105](apps/api/src/services/WorkflowExecutionService.ts#L91-L105) |
+| Workflow 是否 enabled | 禁用时**允许已开始的执行继续**（只阻止新 execution） | [L111-L116](apps/api/src/services/WorkflowExecutionService.ts#L111-L116) |
 
-> ⚠️ **重要设计**：Workflow 被禁用时，已在运行中的 execution 会继续跑完，不会被中断。
+> ⚠️ **重要设计**：Workflow 被禁用时，已在运行中的 execution 会继续跑完，不会被中断。只有 `project.disabled` 才会立即取消运行中的 execution。
 
 ### 5.2 WAITING 恢复（DELAY 场景）
 
@@ -239,10 +299,10 @@ if (!stepExecution) {
 try {
   result = await executeStep(step, execution, stepExecution);
 
-  // 特殊情况：WAIT_FOR_EVENT 把自己标记为 WAITING，直接 return
+  // 特殊情况 A：WAIT_FOR_EVENT 把自己标记为 WAITING，直接 return
   if (updatedStepExecution?.status === WAITING) return;
 
-  // 特殊情况：DELAY 把 workflow 设为 WAITING 并已入队，直接 return
+  // 特殊情况 B：DELAY 把 workflow 设为 WAITING 并已入队，直接 return
   if (!isResumingFromDelay && updatedExecution?.status === WAITING) return;
 
   // 正常完成：标记 step COMPLETED
@@ -259,36 +319,33 @@ try {
 
 ## 6. 步骤类型详解（executeStep）
 
-[executeStep()](file:///d:/fz/0601-2/solo-dogfeeding/code/34-plunk/apps/api/src/services/WorkflowExecutionService.ts#L467-L502) 按 `step.type` 分派到 8 种处理函数。
+[executeStep()](apps/api/src/services/WorkflowExecutionService.ts#L467-L502) 按 `step.type` 分派到 8 种处理函数。
 
 ### 6.1 TRIGGER（入口节点）
 
-```typescript
-// [WorkflowExecutionService.ts#L507-L521]
-// 仅返回 { triggered: true, eventName, timestamp }，无副作用
-```
+[executeTrigger()](apps/api/src/services/WorkflowExecutionService.ts#L507-L521) 仅返回 `{ triggered: true, eventName, timestamp }`，无副作用。
 
 ### 6.2 SEND_EMAIL（发送邮件）
 
-[executeSendEmail()](file:///d:/fz/0601-2/solo-dogfeeding/code/34-plunk/apps/api/src/services/WorkflowExecutionService.ts#L526-L593)
+[executeSendEmail()](apps/api/src/services/WorkflowExecutionService.ts#L526-L593)
 
-1. Zod 校验 step 配置（[WorkflowStepConfigSchemas.sendEmail](file:///d:/fz/0601-2/solo-dogfeeding/code/34-plunk/packages/shared/src/schemas/index.ts#L274-L294)）
+1. Zod 校验 step 配置（[WorkflowStepConfigSchemas.sendEmail](packages/shared/src/schemas/index.ts#L274-L294)）
 2. 组装模板变量作用域：
    ```
    {
      id, email,                          // 联系人基础字段
      ...contactData,                     // Contact.data 自定义字段
-     ...executionContext,                // WorkflowExecution.context（即触发事件的 data）
+     ...executionContext,                // WorkflowExecution.context（触发事件的 data）
      data: contactData,                  // 兼容 {{data.fieldName}} 写法
      unsubscribeUrl, subscribeUrl, manageUrl  // 系统链接
    }
    ```
-3. `renderTemplate()` 渲染 subject/body（支持 `{{var}}` 和 `{{var ?? default}}`，见 [template.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/34-plunk/packages/shared/src/template.ts)）
+3. [renderTemplate()](packages/shared/src/template.ts) 渲染 subject/body（支持 `{{var}}` 和 `{{var ?? default}}`）
 4. `EmailService.sendWorkflowEmail()` 发送（内部走 BullMQ `emailQueue`）
 
 ### 6.3 DELAY（等待时间）
 
-[executeDelay()](file:///d:/fz/0601-2/solo-dogfeeding/code/34-plunk/apps/api/src/services/WorkflowExecutionService.ts#L598-L668)
+[executeDelay()](apps/api/src/services/WorkflowExecutionService.ts#L598-L668)
 
 关键行为：**不是让线程 sleep，而是立即完成当前 step、把 workflow 置为 WAITING，通过 BullMQ 延迟调度下一步**。
 
@@ -298,11 +355,11 @@ try {
 3. 找第一条 outTransition，把 toStep 入队 workflowQueue，delay = 计算出的毫秒数
 ```
 
-入队实现见 [QueueService.queueWorkflowStep()](file:///d:/fz/0601-2/solo-dogfeeding/code/34-plunk/apps/api/src/services/QueueService.ts#L230-L243)，BullMQ worker 在 [workflow-processor-queue.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/34-plunk/apps/api/src/jobs/workflow-processor-queue.ts) 消费。
+入队实现见 [QueueService.queueWorkflowStep()](apps/api/src/services/QueueService.ts#L230-L243)，BullMQ worker 在 [workflow-processor-queue.ts](apps/api/src/jobs/workflow-processor-queue.ts) 消费。
 
 ### 6.4 WAIT_FOR_EVENT（等待特定事件）
 
-[executeWaitForEvent()](file:///d:/fz/0601-2/solo-dogfeeding/code/34-plunk/apps/api/src/services/WorkflowExecutionService.ts#L673-L712)
+[executeWaitForEvent()](apps/api/src/services/WorkflowExecutionService.ts#L673-L712)
 
 ```
 1. StepExecution → WAITING，executeAfter = timeoutDate
@@ -310,7 +367,7 @@ try {
 3. 如果配置了 timeout（秒），入队超时 job：QueueService.queueWorkflowTimeout()
 ```
 
-**事件到达时的唤醒**：`handleEvent()` 在 [WorkflowExecutionService.ts#L401-L462](file:///d:/fz/0601-2/solo-dogfeeding/code/34-plunk/apps/api/src/services/WorkflowExecutionService.ts#L401-L462)
+**事件到达时的唤醒**：[handleEvent()](apps/api/src/services/WorkflowExecutionService.ts#L401-L462)
 
 ```typescript
 // 查询所有 WAITING 的 WAIT_FOR_EVENT step executions
@@ -332,7 +389,7 @@ for (const stepExecution of waitingExecutions) {
 }
 ```
 
-**超时触发**：`processTimeout()` 在 [WorkflowExecutionService.ts#L305-L396](file:///d:/fz/0601-2/solo-dogfeeding/code/34-plunk/apps/api/src/services/WorkflowExecutionService.ts#L305-L396)，BullMQ 超时 job 到期后调用：
+**超时触发**：[processTimeout()](apps/api/src/services/WorkflowExecutionService.ts#L305-L396)，BullMQ 超时 job 到期后调用：
 
 - 检查 step 是否仍为 WAITING（事件可能刚好到达）
 - 标记 COMPLETED，output = `{ timedOut: true, eventName }`
@@ -340,7 +397,7 @@ for (const stepExecution of waitingExecutions) {
 
 ### 6.5 CONDITION（条件分支）
 
-[executeCondition()](file:///d:/fz/0601-2/solo-dogfeeding/code/34-plunk/apps/api/src/services/WorkflowExecutionService.ts#L717-L791)
+[executeCondition()](apps/api/src/services/WorkflowExecutionService.ts#L717-L791)
 
 支持两种模式：
 
@@ -348,18 +405,18 @@ for (const stepExecution of waitingExecutions) {
 
 **2) Multi 模式（switch/case）**：遍历 branches，第一个匹配的返回 `{ branch: branch.id, matchedBranch: branch.name }`；无匹配返回 `branch: 'default'`
 
-**字段解析**：支持点号路径，作用域为：
+**字段解析**：[resolveField()](apps/api/src/services/WorkflowExecutionService.ts#L1181-L1202) 支持点号路径，作用域为：
 ```typescript
 {
   contact: { email, subscribed },
   data: contactData,           // Contact.data
-  workflow: executionContext,  // 触发事件的 data
+  workflow: executionContext, // 触发事件的 data
   event: executionContext,     // 同上（别名）
 }
 ```
-兼容 legacy `contact.data.plan` → 自动转换为 `data.plan`。见 [resolveField()](file:///d:/fz/0601-2/solo-dogfeeding/code/34-plunk/apps/api/src/services/WorkflowExecutionService.ts#L1181-L1202)。
+兼容 legacy `contact.data.plan` → 自动转换为 `data.plan`。
 
-**支持的运算符**（[evaluateCondition()](file:///d:/fz/0601-2/solo-dogfeeding/code/34-plunk/apps/api/src/services/WorkflowExecutionService.ts#L1207-L1263)）：
+**支持的运算符**（[evaluateCondition()](apps/api/src/services/WorkflowExecutionService.ts#L1207-L1263)）：
 
 | 运算符 | null/undefined 行为 |
 |--------|---------------------|
@@ -371,33 +428,33 @@ for (const stepExecution of waitingExecutions) {
 
 ### 6.6 EXIT（终止工作流）
 
-[executeExit()](file:///d:/fz/0601-2/solo-dogfeeding/code/34-plunk/apps/api/src/services/WorkflowExecutionService.ts#L796-L825)：将 WorkflowExecution 标记为 `EXITED`，写入 `exitReason`。
+[executeExit()](apps/api/src/services/WorkflowExecutionService.ts#L796-L825)：将 WorkflowExecution 标记为 `EXITED`，写入 `exitReason`。
 
 ### 6.7 WEBHOOK（调用外部接口）
 
-[executeWebhook()](file:///d:/fz/0601-2/solo-dogfeeding/code/34-plunk/apps/api/src/services/WorkflowExecutionService.ts#L920-L1006)
+[executeWebhook()](apps/api/src/services/WorkflowExecutionService.ts#L920-L1006)
 
-**SSRF 防护**（[safeFetch()](file:///d:/fz/0601-2/solo-dogfeeding/code/34-plunk/apps/api/src/services/WorkflowExecutionService.ts#L871-L908)）：
+**SSRF 防护**（[safeFetch()](apps/api/src/services/WorkflowExecutionService.ts#L871-L908)）：
 - 仅允许 http/https 协议
-- DNS 解析后校验 IP 不在内网/回环/链路本地/共享地址/云 metadata 范围（[isPrivateIp()](file:///d:/fz/0601-2/solo-dogfeeding/code/34-plunk/apps/api/src/services/WorkflowExecutionService.ts#L831-L865)）
+- DNS 解析后校验 IP 不在内网/回环/链路本地/共享地址/云 metadata 范围（[isPrivateIp()](apps/api/src/services/WorkflowExecutionService.ts#L831-L865)）
 - 手动跟随 3xx 重定向，每跳重新做 DNS + IP 校验
 - 最多 5 跳，10 秒超时
 
-**变量渲染**：URL、header values、body 全部经过 `renderTemplate()` / `renderJsonTemplate()`，`method` 不渲染。作用域比 SEND_EMAIL 多一个 `event` 命名空间（即触发事件的 data）。
+**变量渲染**：URL、header values、body 全部经过 `renderTemplate()` / [renderJsonTemplate()](apps/api/src/services/WorkflowExecutionService.ts#L1013-L1028)，`method` 不渲染。作用域比 SEND_EMAIL 多一个 `event` 命名空间（即触发事件的 data）。
 
 ### 6.8 UPDATE_CONTACT（更新联系人）
 
-[executeUpdateContact()](file:///d:/fz/0601-2/solo-dogfeeding/code/34-plunk/apps/api/src/services/WorkflowExecutionService.ts#L1033-L1085)
+[executeUpdateContact()](apps/api/src/services/WorkflowExecutionService.ts#L1033-L1085)
 
 - 合并 `updates` 到 Contact.data
 - 处理 `subscriptionAction`（subscribe/unsubscribe）
-- 若订阅状态改变，会额外触发 `contact.subscribed` / `contact.unsubscribed` 事件（递归进入 EventService.trackEvent）
+- 若订阅状态改变，会额外触发 [EventService.trackEvent()](apps/api/src/services/WorkflowExecutionService.ts#L1069-L1076) 发出 `contact.subscribed` / `contact.unsubscribed` 事件（可能递归触发其他 workflow）
 
 ---
 
 ## 7. Transition 与下一步调度（processNextSteps）
 
-[processNextSteps()](file:///d:/fz/0601-2/solo-dogfeeding/code/34-plunk/apps/api/src/services/WorkflowExecutionService.ts#L1090-L1168)
+[processNextSteps()](apps/api/src/services/WorkflowExecutionService.ts#L1090-L1168)
 
 ```
 transitions = step.outgoingTransitions（按 priority asc 排序）
@@ -431,7 +488,7 @@ Workflow (1) ──→ (N) WorkflowStep
                   └── Contact (N:1)
 ```
 
-见 [schema.prisma](file:///d:/fz/0601-2/solo-dogfeeding/code/34-plunk/packages/db/prisma/schema.prisma#L338-L511)。
+见 [schema.prisma](packages/db/prisma/schema.prisma#L338-L511)。
 
 ### 8.2 WorkflowExecution 状态
 
@@ -461,7 +518,7 @@ Workflow (1) ──→ (N) WorkflowStep
 
 ### 9.1 BullMQ 队列重试策略
 
-[QueueService](file:///d:/fz/0601-2/solo-dogfeeding/code/34-plunk/apps/api/src/services/QueueService.ts#L73-L84) 中 workflowQueue 配置：
+[QueueService](apps/api/src/services/QueueService.ts#L73-L84) 中 workflowQueue 配置：
 
 ```typescript
 defaultJobOptions: {
@@ -472,11 +529,11 @@ defaultJobOptions: {
 }
 ```
 
-worker 并发数为 10，见 [workflow-processor-queue.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/34-plunk/apps/api/src/jobs/workflow-processor-queue.ts#L33)。
+worker 并发数为 10，见 [workflow-processor-queue.ts](apps/api/src/jobs/workflow-processor-queue.ts#L33)。
 
 ### 9.2 步骤级 try-catch
 
-[processStepExecution() catch 块](file:///d:/fz/0601-2/solo-dogfeeding/code/34-plunk/apps/api/src/services/WorkflowExecutionService.ts#L254-L298)：
+[processStepExecution() catch 块](apps/api/src/services/WorkflowExecutionService.ts#L254-L298)：
 
 ```typescript
 catch (error) {
@@ -494,13 +551,15 @@ catch (error) {
 }
 ```
 
+> ⚠️ **重试语义**：BullMQ 重试的是**整个 job**（即 `processStepExecution(executionId, stepId)`），不是单步骤。重试时 step 已被标记 FAILED，[L176-L209](apps/api/src/services/WorkflowExecutionService.ts#L176-L209) 的 findFirst 不会找到 PENDING/RUNNING 的 stepExecution，会创建新的 RUNNING 记录重新执行。这意味着 step 可能被多次执行——side-effect（如发邮件、调 webhook）需要业务方自行幂等。
+
 ### 9.3 Worker 优雅关闭
 
-[worker.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/34-plunk/apps/api/src/jobs/worker.ts#L86-L121) 监听 SIGINT / SIGTERM / uncaughtException / unhandledRejection，对每个 worker 调用 `worker.close()` 等待当前 job 完成后退出。
+[worker.ts](apps/api/src/jobs/worker.ts#L86-L121) 监听 SIGINT / SIGTERM / uncaughtException / unhandledRejection，对每个 worker 调用 `worker.close()` 等待当前 job 完成后退出。
 
 ### 9.4 项目禁用时的清理
 
-[QueueService.cancelAllProjectJobs()](file:///d:/fz/0601-2/solo-dogfeeding/code/34-plunk/apps/api/src/services/QueueService.ts#L545-L640)：
+[QueueService.cancelAllProjectJobs()](apps/api/src/services/QueueService.ts#L545-L640)：
 
 - 扫描 scheduled/email/campaign/workflow 四个队列中 pending/delayed job
 - 校验属于该 project 后移除
@@ -515,16 +574,20 @@ catch (error) {
 
 | 功能 | 文件 |
 |------|------|
-| 核心执行引擎 | [WorkflowExecutionService.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/34-plunk/apps/api/src/services/WorkflowExecutionService.ts) |
-| 事件服务 + workflow 触发 | [EventService.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/34-plunk/apps/api/src/services/EventService.ts) |
-| Workflow CRUD + 手动启动 | [WorkflowService.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/34-plunk/apps/api/src/services/WorkflowService.ts) |
-| BullMQ 队列管理 | [QueueService.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/34-plunk/apps/api/src/services/QueueService.ts) |
-| Workflow Worker | [workflow-processor-queue.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/34-plunk/apps/api/src/jobs/workflow-processor-queue.ts) |
-| Worker 总入口 | [worker.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/34-plunk/apps/api/src/jobs/worker.ts) |
-| 公共 API：/v1/track | [Actions.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/34-plunk/apps/api/src/controllers/Actions.ts) |
-| 内部 API：/events/track | [Events.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/34-plunk/apps/api/src/controllers/Events.ts) |
-| SNS/SES + Stripe Webhook | [Webhooks.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/34-plunk/apps/api/src/controllers/Webhooks.ts) |
-| Step Config Zod Schemas | [schemas/index.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/34-plunk/packages/shared/src/schemas/index.ts) |
-| 模板变量渲染 | [template.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/34-plunk/packages/shared/src/template.ts) |
-| 数据模型 | [schema.prisma](file:///d:/fz/0601-2/solo-dogfeeding/code/34-plunk/packages/db/prisma/schema.prisma) |
-| Redis Key 定义 | [keys.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/34-plunk/apps/api/src/services/keys.ts) |
+| 核心执行引擎 | [WorkflowExecutionService.ts](apps/api/src/services/WorkflowExecutionService.ts) |
+| 事件服务 + workflow 触发 | [EventService.ts](apps/api/src/services/EventService.ts) |
+| Workflow CRUD + 手动启动 | [WorkflowService.ts](apps/api/src/services/WorkflowService.ts) |
+| BullMQ 队列管理 | [QueueService.ts](apps/api/src/services/QueueService.ts) |
+| Workflow Worker | [workflow-processor-queue.ts](apps/api/src/jobs/workflow-processor-queue.ts) |
+| Worker 总入口 | [worker.ts](apps/api/src/jobs/worker.ts) |
+| 邮件发送 Worker | [email-processor.ts](apps/api/src/jobs/email-processor.ts) |
+| 公共 API：/v1/track | [Actions.ts](apps/api/src/controllers/Actions.ts) |
+| 内部 API：/events/track | [Events.ts](apps/api/src/controllers/Events.ts) |
+| SNS/SES + Stripe Webhook | [Webhooks.ts](apps/api/src/controllers/Webhooks.ts) |
+| ContactService（订阅事件） | [ContactService.ts](apps/api/src/services/ContactService.ts) |
+| EmailService（email.sent 等） | [EmailService.ts](apps/api/src/services/EmailService.ts) |
+| SegmentService（segment entry/exit） | [SegmentService.ts](apps/api/src/services/SegmentService.ts) |
+| Step Config Zod Schemas | [schemas/index.ts](packages/shared/src/schemas/index.ts) |
+| 模板变量渲染 | [template.ts](packages/shared/src/template.ts) |
+| 数据模型 | [schema.prisma](packages/db/prisma/schema.prisma) |
+| Redis Key 定义 | [keys.ts](apps/api/src/services/keys.ts) |
