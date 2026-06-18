@@ -651,3 +651,138 @@ catch (error) {
 | 模板变量渲染 | [template.ts](packages/shared/src/template.ts) |
 | 数据模型 | [schema.prisma](packages/db/prisma/schema.prisma) |
 | Redis Key 定义 | [keys.ts](apps/api/src/services/keys.ts) |
+
+---
+
+## 11. 深度分析：事件名、并发冲突、重入与重试
+
+### 11.1 邮件事件名两套标准
+
+代码中存在两套邮件事件命名，来源不同、写入方式不同、是否能触发 workflow 也不同：
+
+| 语义 | SNS Webhook（会触发 workflow） | EmailService.handleWebhookEvent（不触发 workflow） |
+|------|------|------|
+| 投递成功 | `email.delivery` | `email.delivered` |
+| 打开 | `email.open` | `email.opened` |
+| 点击 | `email.click` | `email.clicked` |
+| 退信 | `email.bounce` | `email.bounced` |
+| 投诉 | `email.complaint` | `email.complained` |
+| 入站 | `email.received` | — |
+| 发送 | `email.sent`（email-processor / EmailService.sendEmail） | — |
+
+**来源解析**：
+
+- **SNS Webhook** 路径（[Webhooks.ts#L312](apps/api/src/controllers/Webhooks.ts#L312)）：
+  ```typescript
+  const eventName = `email.${eventType.toLowerCase()}`;
+  // SES eventType 枚举：'Delivery' | 'Open' | 'Click' | 'Bounce' | 'Complaint'
+  // 转小写后：email.delivery / email.open / email.click / email.bounce / email.complaint
+  ```
+  然后调用 `EventService.trackEvent()` → 写入 Event 表 + 可能触发/唤醒 workflow
+
+- **EmailService.handleWebhookEvent** 路径（[EmailService.ts#L462](apps/api/src/services/EmailService.ts#L462)）：
+  ```typescript
+  // 方法签名：eventType: 'opened' | 'clicked' | 'bounced' | 'complained' | 'delivered'
+  name: `email.${eventType}`
+  // 结果：email.opened / email.clicked / email.bounced / email.complained / email.delivered
+  ```
+  然后直接 `prisma.event.create()` → 仅写 Event 表，**不触发也不唤醒任何 workflow**
+
+**影响**：
+
+1. **WAIT_FOR_EVENT 匹配问题**：如果 workflow 等待 `email.open`（SNS 标准名），那 `email.opened`（handleWebhookEvent 标准名）不会被匹配；反之亦然。当前 `EmailService.handleWebhookEvent` 不走 `EventService.trackEvent()`，所以它写入的 `email.opened` 等事件不会触发任何 workflow，不存在匹配失败问题。但如果将来有人修改代码让它也走 `trackEvent()`，就必须统一事件名。
+
+2. **Event 表中同一封邮件可能有两条事件记录**：一条来自 SNS 的 `email.open`（经 trackEvent），一条来自 handleWebhookEvent 的 `email.opened`（直接 prisma 写入）。这两条记录事件名不同，查询时需要注意。
+
+3. **`isReservedEvent()` 的注释**（[EventService.ts#L320](apps/api/src/services/EventService.ts#L320)）列出的是 SNS 标准：`email.delivery, email.open, email.click, email.bounce, email.complaint`，与实际代码逻辑一致——它按 `email.*` 前缀判断，两种命名都会被拦截。
+
+---
+
+### 11.2 WAIT_FOR_EVENT 等待与超时并发时的分支冲突
+
+当一个 WAIT_FOR_EVENT 步骤同时配置了 `timeout` 秒数时，存在两条独立的唤醒路径：
+
+| 路径 | 触发方 | 输出 | transition 选择逻辑 |
+|------|--------|------|---------------------|
+| **事件到达** | `handleEvent()` | `{ eventReceived: true, eventName, eventData, receivedAt }` | 走 `processNextSteps()`，stepResult 无 `branch` 字段，匹配不到 `condition.branch`，走**无条件 transition** 或 `evaluateTransitionCondition`（未实现） |
+| **超时到期** | `processTimeout()` | `{ timedOut: true, eventName }` | 在 processTimeout 内部**直接匹配** transition：找 `condition.branch === 'timeout'` 或 `condition.fallback === true`；没有则走**第一条** transition |
+
+**并发竞态分析**：
+
+两条路径都有"先检查 stepExecution.status 是否仍为 WAITING"的保护：
+
+- `handleEvent()`：只查询 `status: WAITING` 的 stepExecution，找到后立即更新为 COMPLETED
+- `processTimeout()`：[L327-L329](apps/api/src/services/WorkflowExecutionService.ts#L327-L329) 先读 stepExecution，如果 `status !== WAITING` 直接 return
+
+理论上可能出现的竞态窗口：
+
+```
+时间线：
+T1: handleEvent() 查到 stepExecution (status=WAITING)
+T2: processTimeout() 查到 stepExecution (status=WAITING)
+T3: handleEvent() 更新 stepExecution → COMPLETED，取消超时 job
+T4: processTimeout() 也更新 stepExecution → COMPLETED（覆盖了 handleEvent 的 output）
+T5: processTimeout() 找到 fallback/timeout transition，调用 processStepExecution
+T6: handleEvent() 调用 processNextSteps
+→ 两条路径都推进了 workflow，导致同一步骤被执行两次
+```
+
+但实际上这个竞态窗口很窄，因为：
+1. `handleEvent()` 在更新 COMPLETED 后立即 `cancelWorkflowTimeout()`，BullMQ 的 cancel 通常能阻止超时 job 执行
+2. 即使 cancel 未能及时生效，`processTimeout()` 的 `findUnique` 读到的 stepExecution 如果已被 handleEvent 更新为 COMPLETED，`status !== WAITING` 判断会直接 return
+
+**分支冲突的核心问题**：
+
+当事件先到达时，`handleEvent()` 调用 `processNextSteps(stepExecution.execution, stepExecution.step, {eventReceived: true})`。stepResult 是 `{eventReceived: true}`，没有 `branch` 字段。在 `processNextSteps()` 的 transition 匹配逻辑中：
+
+1. `!condition` → 匹配无条件 transition（正常路径）
+2. `condition.branch === stepResult.branch` → stepResult 无 branch，永远不匹配
+3. `evaluateTransitionCondition()` → 未实现，恒返回 false
+
+**结论**：如果 WAIT_FOR_EVENT 后面连了一个带 `condition.branch === 'timeout'` 的 transition，**事件到达时不会匹配到这条 timeout transition**，但会匹配到同步骤的无条件 transition。如果设计者期望"事件到达走正常路径、超时走 timeout 路径"，需要确保 WAIT_FOR_EVENT 后面有一条**无条件 transition** 作为正常路径，同时有一条 `branch: 'timeout'` transition 作为超时路径。
+
+如果 WAIT_FOR_EVENT 后面**只有** `branch: 'timeout'` 的 transition（没有无条件 transition），事件到达时 `processNextSteps` 会找不到匹配 transition，workflow 直接 COMPLETED——这是一个容易踩的陷阱。
+
+---
+
+### 11.3 失败后重建执行是否受重入保护
+
+[startWorkflowForContact()](apps/api/src/services/EventService.ts#L434-L460) 的重入检查不受 execution 状态限制：
+
+| `allowReentry` | 查询条件 | FAILED 的 execution 是否阻止新建 |
+|---|---|---|
+| `false`（默认） | `findFirst({ where: { workflowId, contactId } })` — **不限状态** | ❌ **阻止**（FAILED 也是已存在的 execution） |
+| `true` | `findFirst({ where: { workflowId, contactId, status: 'RUNNING' } })` | ✅ **不阻止**（FAILED 不是 RUNNING） |
+
+[WorkflowService.startExecution()](apps/api/src/services/WorkflowService.ts#L987-L1016) 有相同的逻辑，且在 `allowReentry=false` 时抛 409 HTTP 异常（含现有 execution 的 status 信息）。
+
+**结论**：
+
+- `allowReentry=false`（默认）：一旦联系人在该 workflow 有过**任何状态**的 execution（包括 FAILED、COMPLETED、EXITED、CANCELLED），就不能再创建新的 execution。这意味着**失败后无法通过重新触发事件来恢复**，必须手动删除旧 execution 记录或由管理员干预。
+- `allowReentry=true`：只要没有 RUNNING 的 execution（FAILED 不算），就可以新建。失败后自动恢复成为可能——但代价是同一联系人可以同时有多条 execution 历史。
+
+---
+
+### 11.4 不同执行入口是否进入 BullMQ 重试队列
+
+`processStepExecution()` 有 4 个调用入口，但只有 1 个走 BullMQ 队列：
+
+| 入口 | 调用方式 | 是否在 BullMQ job 内 | 失败时 BullMQ 是否重试 |
+|------|---------|---------------------|----------------------|
+| [workflow-processor-queue.ts#L28](apps/api/src/jobs/workflow-processor-queue.ts#L28) | BullMQ worker 回调 | ✅ 是 | ✅ 是（但无效，见 §2.6） |
+| [EventService.startWorkflowForContact()](apps/api/src/services/EventService.ts#L484-L485) | `await` 同步调用 | ❌ 否 | ❌ 否（异常被 try-catch 吞掉，只打日志） |
+| [WorkflowService.startExecution()](apps/api/src/services/WorkflowService.ts#L1038-L1040) | `.catch()` fire-and-forget | ❌ 否 | ❌ 否（异常被 .catch 吞掉，只打日志） |
+| [processNextSteps()](apps/api/src/services/WorkflowExecutionService.ts#L1167) 递归 | `await` 同步调用 | 取决于外层 | 取决于外层 |
+| [processTimeout()](apps/api/src/services/WorkflowExecutionService.ts#L370) 内部调用 | `await` 同步调用 | 取决于外层 | 取决于外层 |
+
+关键区别：
+
+1. **BullMQ 入口**：`processStepExecution` 失败时 catch 块把 execution 标记为 FAILED，然后 `throw error` 传给 BullMQ。BullMQ 按退避策略安排重试，但如 §2.6 分析，重试时顶部状态校验会直接 return，**实际不执行任何步骤**。
+
+2. **EventService.startWorkflowForContact 入口**：整个 processStepExecution 调用被 try-catch 包裹（[EventService.ts#L418-L488](apps/api/src/services/EventService.ts#L418-L488)），异常被 `signale.error` 吞掉。execution 已在 processStepExecution 内部被标记为 FAILED，但 BullMQ 完全不知道这次失败，**不会有任何重试**。
+
+3. **WorkflowService.startExecution 入口**：用 `.catch()` fire-and-forget（[WorkflowService.ts#L1038-L1040](apps/api/src/services/WorkflowService.ts#L1038-L1040)），异常被吞掉，**不会有任何重试**。且这个入口是在 HTTP 请求处理流程中调用的，processStepExecution 是在后台异步执行。
+
+4. **processNextSteps 递归调用**：如果最外层入口是 BullMQ worker，那整条递归链上的任何步骤失败都会抛到 BullMQ 层；如果最外层是 startWorkflowForContact，则失败被 try-catch 吞掉。
+
+**总结**：当前实现中 BullMQ 的 `attempts: 3` 重试配置对 workflow 执行**没有实际恢复效果**。无论从哪个入口进入，步骤失败后都不会真正重跑。唯一的区别是 BullMQ 入口会空转 3 次 attempts，而直接调用入口则完全不会重试。
