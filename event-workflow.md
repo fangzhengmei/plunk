@@ -129,9 +129,22 @@
 
 > ⚠️ **递归风险点**：`UPDATE_CONTACT` 步骤触发 `contact.subscribed` 事件，该事件可能又触发监听该事件的其他 workflow，形成链式调用。`ContactService` 触发的 `contact.subscribed` 同理可能触发新的 workflow execution。
 
-### 2.3 不触发 workflow 的入口
+### 2.3 只记录事件 / 不启动新 workflow 的路径
 
-**`POST /webhooks/incoming/stripe`**（[Webhooks.receiveStripeWebhook](apps/api/src/controllers/Webhooks.ts#L483-L789)）是计费回调，**完全不进入事件系统**：
+以下路径容易和“触发 workflow”混淆：有的只写 Event 表，有的完全不进事件系统，有的会唤醒等待节点但不会启动新的 workflow execution。
+
+| 路径 | 是否写 Event 表 | 是否启动新 workflow | 是否唤醒 WAIT_FOR_EVENT | 代码位置 |
+|------|----------------|----------------------|--------------------------|---------|
+| `POST /webhooks/incoming/stripe` | 否 | 否 | 否 | [Webhooks.receiveStripeWebhook](apps/api/src/controllers/Webhooks.ts#L483-L789) |
+| `EmailService.handleWebhookEvent()` 末尾 | 是，直接 `prisma.event.create()` 写 `email.opened` / `email.clicked` / `email.delivered` 等 | 否，因为没有调用 `EventService.trackEvent()` | 否，因为没有进入 `handleEvent()` | [EmailService.ts#L574-L583](apps/api/src/services/EmailService.ts#L574-L583) |
+| `EventService.trackEvent()` 无 contactId 时 | 是 | 否，`triggerWorkflows()` 的 `if (contactId)` 会跳过新 execution | 可能会，`handleEvent()` 无 contactId 时不加 contact 过滤 | [EventService.ts#L22-L47](apps/api/src/services/EventService.ts#L22-L47) |
+
+> ⚠️ `EmailService.handleWebhookEvent()` 与 SNS Webhook 的区别：
+> - `EmailService.handleWebhookEvent()` 被内部直接调用（非 SNS 路径）时走 `prisma.event.create()` → **不触发 workflow**
+> - SNS Webhook 路径（`Webhooks.receiveSNSWebhook`）调用 `EventService.trackEvent()` → **触发 workflow**
+> - 两条路径都会写入 Event 表，但入站渠道不同
+
+Stripe Webhook 的具体处理行为：
 
 | Stripe 事件类型 | 处理行为 |
 |----------------|---------|
@@ -142,9 +155,56 @@
 | `customer.subscription.updated` | 仅记录日志 + Ntfy 通知 |
 | `radar.early_fraud_warning.created` | refund charge，将 card fingerprint/email 加入 Stripe Radar blocklist |
 
-整个过程**不调用 `EventService.trackEvent()`**，不写入 Event 表，不会启动或唤醒任何 workflow。它的副作用仅限于 `Project` 表的状态字段和外部 Stripe API。
+---
 
-> 注意：`EmailService.handleWebhookEvent()` 末尾会直接 `prisma.event.create()` 写入 `email.{eventType}`，但没有调用 `EventService.trackEvent()`，因此这条直接写库路径不会启动或唤醒 workflow；真正能触发 workflow 的邮件状态事件来自 SNS webhook 的 `EventService.trackEvent()` 调用。
+## 2.4 无联系人事件：新启动 vs 唤醒等待节点的差异
+
+同一个无 `contactId` 的事件（project-level 事件）经过 `EventService.trackEvent()` 后，两个分支行为完全不同：
+
+| 分支 | 是否有 contactId 过滤 | 实际行为 | 代码位置 |
+|------|----------------------|---------|---------|
+| `triggerWorkflows()`（启动新 execution） | 有 `if (contactId) { ... }` 判断 | **无 contactId → 跳过，完全不启动新 workflow**，只打 info 日志 | [EventService.ts#L397-L405](apps/api/src/services/EventService.ts#L397-L405) |
+| `handleEvent()`（唤醒 WAIT_FOR_EVENT） | `...(contactId ? {contactId} : {})` 动态拼装 where | **无 contactId → 不加 contact 过滤**，该项目下所有等待该事件的 WAIT_FOR_EVENT step execution 都会被唤醒 | [WorkflowExecutionService.ts#L408-L415](apps/api/src/services/WorkflowExecutionService.ts#L408-L415) |
+
+结论：**无联系人事件只能"广播式"唤醒所有等待节点，但永远不会启动任何新的 workflow execution**。新 workflow 只能由带 `contactId` 的事件启动。
+
+---
+
+## 2.5 等待状态下的重入规则
+
+当一个联系人的 workflow execution 处于 `WAITING` 状态（DELAY 或 WAIT_FOR_EVENT）时，相同事件再次到达，重入检查 [startWorkflowForContact()](apps/api/src/services/EventService.ts#L434-L460) 的行为：
+
+| `workflow.allowReentry` | 重入检查条件 | WAITING 时是否允许启动新 execution |
+|---|---|---|
+| `false`（默认） | `findFirst({ where: { workflowId, contactId } })` — 联系人有 **任何状态** 的 execution 就阻止 | ❌ **不允许**（WAITING 也是已存在的 execution） |
+| `true` | `findFirst({ where: { workflowId, contactId, status: 'RUNNING' } })` — 只看 RUNNING | ✅ **允许**（WAITING 不匹配 `status: 'RUNNING'`） |
+
+> ⚠️ `allowReentry=true` 时，处于 WAITING 的 execution 与新启动的 execution 会**共存**。若 WAITING 是 WAIT_FOR_EVENT，后续该事件到达时 `handleEvent()` 会按照 contactId + 事件名查到两个等待者（旧 WAITING + 若新 execution 也走到 WAIT_FOR_EVENT 则是两个），都被唤醒。若 WAITING 是 DELAY，则到时间后旧的和新的 execution 会各自独立继续。
+
+另外，`handleEvent()` 唤醒 WAIT_FOR_EVENT 时没有额外去重逻辑，只是按 `status: WAITING` + `step.type: 'WAIT_FOR_EVENT'` + `step.config.eventName === eventName` 过滤；一旦某个 stepExecution 被前一个事件标记为 `COMPLETED`，后续事件就查不到它了，因此 **WAIT_FOR_EVENT step 只会被第一个匹配事件唤醒一次**。
+
+---
+
+## 2.6 首次执行失败是否自动重试
+
+**答案：不会自动重试。** 虽然 BullMQ 的 workflowQueue 配置了 `attempts: 3` 指数退避（2s/4s/8s），但实际效果会被 [processStepExecution()](apps/api/src/services/WorkflowExecutionService.ts#L80-L89) 顶部的状态校验拦截：
+
+```
+失败流程：
+1. executeStep() 抛出异常
+2. catch 块把 StepExecution → FAILED，把 WorkflowExecution → FAILED，发 Ntfy 通知
+3. catch 块末尾 `throw error` 把异常抛给 BullMQ
+4. BullMQ 按 attempts 安排重试（2s 后执行第 2 次）
+5. 第 2 次 job 执行 processStepExecution(executionId, stepId)
+6. 顶部校验：execution.status === 'FAILED'，不属于 RUNNING 或 WAITING
+7. 直接 return（signale 打一条 skipping 日志），不执行任何步骤
+```
+
+重试调度只发生在进入 workflowQueue 的 job 上（例如 DELAY 恢复、WAIT_FOR_EVENT 超时），但 processStepExecution 会拒绝处理 FAILED 状态的 execution。因此虽然 BullMQ 会消费剩余的 attempts（第 2、3 次），但实际上什么都没做。事件触发后由 `startWorkflowForContact()` 直接 `await processStepExecution()` 的首段同步执行，原本就不经过 workflowQueue 的 attempts；手动启动路径也是 fire-and-forget 调用，同样没有队列重试。
+
+对应的失败恢复目前只能：
+- **手动重跑**：通过 Workflows API 手动新建 execution
+- **修复 bug 后重新触发事件**：让联系人再次产生同样的事件（重入规则允许的情况下）
 
 ---
 
@@ -551,7 +611,7 @@ catch (error) {
 }
 ```
 
-> ⚠️ **重试语义**：BullMQ 重试的是**整个 job**（即 `processStepExecution(executionId, stepId)`），不是单步骤。重试时 step 已被标记 FAILED，[L176-L209](apps/api/src/services/WorkflowExecutionService.ts#L176-L209) 的 findFirst 不会找到 PENDING/RUNNING 的 stepExecution，会创建新的 RUNNING 记录重新执行。这意味着 step 可能被多次执行——side-effect（如发邮件、调 webhook）需要业务方自行幂等。
+> ⚠️ **重试语义**：BullMQ attempts 只对进入 workflowQueue 的 job 生效；失败时 workflow 已被标记为 `FAILED`，下一次 job 进入 [L80-L89](apps/api/src/services/WorkflowExecutionService.ts#L80-L89) 会因状态不是 `RUNNING` / `WAITING` 直接 return。因此当前实现不会真正重跑失败步骤，发送邮件或调用 webhook 等副作用不会被 attempts 自动重复执行；恢复需要手动新建 execution 或重新触发事件。
 
 ### 9.3 Worker 优雅关闭
 
